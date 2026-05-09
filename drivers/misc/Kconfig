@@ -4,6 +4,12 @@
 #
 
 menu "Misc devices"
+config VIRT_LLM_PCI
+	tristate "Virtual LLM PCI accelerator test driver"
+	depends on PCI
+	help
+	  Driver for the QEMU virt-llm PCI accelerator prototype. It validates
+	  BAR registers, DMA queue submission, and interrupt completion.
 
 config SENSORS_LIS3LV02D
 	tristate

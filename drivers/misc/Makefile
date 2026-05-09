@@ -1,3 +1,4 @@
+obj-$(CONFIG_VIRT_LLM_PCI)	+= virt_llm_pci.o
 # SPDX-License-Identifier: GPL-2.0
 #
 # Makefile for misc devices that really don't fit anywhere else.
