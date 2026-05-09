@@ -55,6 +55,8 @@
 #define VIRT_LLM_OP_INFER       0x0001
 #define VIRT_LLM_OP_DMA_COPY    0x0010
 #define VIRT_LLM_OP_VEC_ADD_U32 0x0100
+#define VIRT_LLM_OP_SOFTMAX_Q16 0x0101
+#define VIRT_LLM_OP_POOL_MAX_U32 0x0102
 #define VIRT_LLM_OP_GEMM_U32    0x0200
 #define VIRT_LLM_OP_BAD_TEST    0xffff
 #define VIRT_LLM_DESC_F_READY   BIT(0)
@@ -436,7 +438,9 @@ static int virt_llm_run_vector_add_selftest(struct virt_llm_dev *vdev)
 
 static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 {
-	struct virt_llm_desc *desc = &vdev->queue[3];
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 idx = head % VIRT_LLM_QUEUE_LEN;
+	struct virt_llm_desc *desc = &vdev->queue[idx];
 	__le32 *a = (__le32 *)vdev->input;
 	__le32 *b = (__le32 *)vdev->input_b;
 	__le32 *out = (__le32 *)vdev->output;
@@ -462,11 +466,11 @@ static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
 	desc->input_addr = cpu_to_le64(vdev->input_dma);
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
-	desc->rsvd0 = cpu_to_le32(4);
+	desc->rsvd0 = cpu_to_le32(6);
 	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
 	desc->rsvd2 = cpu_to_le64(dims);
 
-	ret = virt_llm_submit_tail(vdev, 4, "gemm self-test");
+	ret = virt_llm_submit_tail(vdev, head + 1, "gemm self-test");
 	if (ret)
 		return ret;
 
@@ -487,7 +491,7 @@ static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 			return -EIO;
 		}
 	}
-	ret = virt_llm_check_cq(vdev, 4, VIRT_LLM_OP_GEMM_U32,
+	ret = virt_llm_check_cq(vdev, 6, VIRT_LLM_OP_GEMM_U32,
 				VIRT_LLM_BACKEND_TENSOR,
 				VIRT_LLM_DESC_COMPLETE, expected_sum);
 	if (ret)
@@ -495,6 +499,126 @@ static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 
 	dev_info(&vdev->pdev->dev, "gemm ok: m=2 n=2 k=2 checksum=0x%08x\n",
 		 expected_sum);
+	return 0;
+}
+
+static int virt_llm_run_softmax_selftest(struct virt_llm_dev *vdev)
+{
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 idx = head % VIRT_LLM_QUEUE_LEN;
+	struct virt_llm_desc *desc = &vdev->queue[idx];
+	__le32 *input = (__le32 *)vdev->input;
+	__le32 *out = (__le32 *)vdev->output;
+	u32 expected[] = { 8192, 8192, 16384, 32768 };
+	u32 values[] = { 1, 1, 2, 4 };
+	u32 expected_sum = 0;
+	int ret;
+
+	memset(vdev->output, 0, VIRT_LLM_TEST_LEN);
+	for (int i = 0; i < ARRAY_SIZE(values); i++) {
+		input[i] = cpu_to_le32(values[i]);
+		expected_sum += expected[i];
+	}
+
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(VIRT_LLM_OP_SOFTMAX_Q16);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+	desc->input_addr = cpu_to_le64(vdev->input_dma);
+	desc->output_addr = cpu_to_le64(vdev->output_dma);
+	desc->len = cpu_to_le32(ARRAY_SIZE(values));
+	desc->rsvd0 = cpu_to_le32(4);
+
+	ret = virt_llm_submit_tail(vdev, head + 1, "softmax self-test");
+	if (ret)
+		return ret;
+
+	if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_COMPLETE ||
+	    le32_to_cpu(desc->result) != expected_sum) {
+		dev_err(&vdev->pdev->dev,
+			"softmax bad status=0x%08x result=0x%08x expected=0x%08x\n",
+			le32_to_cpu(desc->status), le32_to_cpu(desc->result),
+			expected_sum);
+		return -EIO;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(expected); i++) {
+		if (le32_to_cpu(out[i]) != expected[i]) {
+			dev_err(&vdev->pdev->dev,
+				"softmax mismatch at %d got=%u expected=%u\n",
+				i, le32_to_cpu(out[i]), expected[i]);
+			return -EIO;
+		}
+	}
+
+	ret = virt_llm_check_cq(vdev, 4, VIRT_LLM_OP_SOFTMAX_Q16,
+				VIRT_LLM_BACKEND_VECTOR,
+				VIRT_LLM_DESC_COMPLETE, expected_sum);
+	if (ret)
+		return ret;
+
+	dev_info(&vdev->pdev->dev, "softmax q16 ok: count=%zu checksum=0x%08x\n",
+		 ARRAY_SIZE(values), expected_sum);
+	return 0;
+}
+
+static int virt_llm_run_pooling_selftest(struct virt_llm_dev *vdev)
+{
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 idx = head % VIRT_LLM_QUEUE_LEN;
+	struct virt_llm_desc *desc = &vdev->queue[idx];
+	__le32 *input = (__le32 *)vdev->input;
+	__le32 *out = (__le32 *)vdev->output;
+	u32 values[] = { 3, 1, 7, 6, 2, 9, 4, 5 };
+	u32 expected[] = { 3, 7, 9, 5 };
+	u32 expected_sum = 0;
+	u64 args = 2;
+	int ret;
+
+	memset(vdev->output, 0, VIRT_LLM_TEST_LEN);
+	for (int i = 0; i < ARRAY_SIZE(values); i++)
+		input[i] = cpu_to_le32(values[i]);
+	for (int i = 0; i < ARRAY_SIZE(expected); i++)
+		expected_sum += expected[i];
+
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(VIRT_LLM_OP_POOL_MAX_U32);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+	desc->input_addr = cpu_to_le64(vdev->input_dma);
+	desc->output_addr = cpu_to_le64(vdev->output_dma);
+	desc->len = cpu_to_le32(ARRAY_SIZE(values));
+	desc->rsvd0 = cpu_to_le32(5);
+	desc->rsvd2 = cpu_to_le64(args);
+
+	ret = virt_llm_submit_tail(vdev, head + 1, "pooling self-test");
+	if (ret)
+		return ret;
+
+	if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_COMPLETE ||
+	    le32_to_cpu(desc->result) != expected_sum) {
+		dev_err(&vdev->pdev->dev,
+			"pooling bad status=0x%08x result=0x%08x expected=0x%08x\n",
+			le32_to_cpu(desc->status), le32_to_cpu(desc->result),
+			expected_sum);
+		return -EIO;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(expected); i++) {
+		if (le32_to_cpu(out[i]) != expected[i]) {
+			dev_err(&vdev->pdev->dev,
+				"pooling mismatch at %d got=%u expected=%u\n",
+				i, le32_to_cpu(out[i]), expected[i]);
+			return -EIO;
+		}
+	}
+
+	ret = virt_llm_check_cq(vdev, 5, VIRT_LLM_OP_POOL_MAX_U32,
+				VIRT_LLM_BACKEND_VECTOR,
+				VIRT_LLM_DESC_COMPLETE, expected_sum);
+	if (ret)
+		return ret;
+
+	dev_info(&vdev->pdev->dev, "pool max ok: count=%zu window=2 checksum=0x%08x\n",
+		 ARRAY_SIZE(values), expected_sum);
 	return 0;
 }
 
@@ -510,7 +634,7 @@ static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 	memset(desc, 0, sizeof(*desc));
 	desc->opcode = cpu_to_le32(VIRT_LLM_OP_BAD_TEST);
 	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
-	desc->rsvd0 = cpu_to_le32(5);
+	desc->rsvd0 = cpu_to_le32(7);
 
 	ret = virt_llm_submit_tail(vdev, head + 1, "error self-test");
 	if (ret)
@@ -526,7 +650,7 @@ static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 			le32_to_cpu(desc->status), q_status, q_error);
 		return -EIO;
 	}
-	ret = virt_llm_check_cq(vdev, 5, VIRT_LLM_OP_BAD_TEST, U32_MAX,
+	ret = virt_llm_check_cq(vdev, 7, VIRT_LLM_OP_BAD_TEST, U32_MAX,
 				VIRT_LLM_DESC_UNSUPP, 0);
 	if (ret)
 		return ret;
@@ -624,6 +748,18 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	}
 
 	ret = virt_llm_run_vector_add_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_softmax_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_pooling_selftest(vdev);
 	if (ret) {
 		pci_free_irq_vectors(pdev);
 		return ret;
