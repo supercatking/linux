@@ -33,6 +33,11 @@
 #define VIRT_LLM_REG_Q_CTRL     0x44
 #define VIRT_LLM_REG_Q_STATUS   0x48
 #define VIRT_LLM_REG_Q_ERROR    0x4c
+#define VIRT_LLM_REG_CQ_SIZE    0x50
+#define VIRT_LLM_REG_CQ_LO      0x54
+#define VIRT_LLM_REG_CQ_HI      0x58
+#define VIRT_LLM_REG_CQ_HEAD    0x5c
+#define VIRT_LLM_REG_CQ_TAIL    0x60
 
 #define VIRT_LLM_MAGIC          0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_STATUS_XOR     0xa5a5a5a5u
@@ -42,6 +47,7 @@
 #define VIRT_LLM_FEATURE_MSI    BIT(1)
 #define VIRT_LLM_FEATURE_MSIX   BIT(2)
 #define VIRT_LLM_FEATURE_QCTRL  BIT(3)
+#define VIRT_LLM_FEATURE_CQ     BIT(4)
 #define VIRT_LLM_IRQ_COMPLETE   BIT(0)
 #define VIRT_LLM_IRQ_ERROR      BIT(1)
 #define VIRT_LLM_IRQ_ALL        (VIRT_LLM_IRQ_COMPLETE | VIRT_LLM_IRQ_ERROR)
@@ -60,7 +66,13 @@
 #define VIRT_LLM_Q_STATUS_ERR   BIT(1)
 #define VIRT_LLM_Q_ERR_OPCODE   3
 #define VIRT_LLM_QUEUE_LEN      4
+#define VIRT_LLM_CQ_LEN         8
 #define VIRT_LLM_TEST_LEN       64
+
+#define VIRT_LLM_BACKEND_COMPAT 0
+#define VIRT_LLM_BACKEND_DMA    1
+#define VIRT_LLM_BACKEND_VECTOR 2
+#define VIRT_LLM_BACKEND_TENSOR 3
 
 struct virt_llm_desc {
 	__le32 opcode;
@@ -76,12 +88,24 @@ struct virt_llm_desc {
 	__le64 rsvd3;
 } __packed;
 
+struct virt_llm_cpl {
+	__le32 command_id;
+	__le32 opcode;
+	__le32 backend;
+	__le32 status;
+	__le32 result;
+	__le32 q_head;
+	__le64 rsvd0;
+} __packed;
+
 struct virt_llm_dev {
 	struct pci_dev *pdev;
 	void __iomem *bar;
 	struct completion done;
 	struct virt_llm_desc *queue;
 	dma_addr_t queue_dma;
+	struct virt_llm_cpl *cq;
+	dma_addr_t cq_dma;
 	u8 *input;
 	dma_addr_t input_dma;
 	u8 *input_b;
@@ -115,6 +139,12 @@ static int virt_llm_alloc_dma(struct virt_llm_dev *vdev)
 	if (!vdev->queue)
 		return -ENOMEM;
 
+	vdev->cq = dmam_alloc_coherent(dev,
+				       sizeof(*vdev->cq) * VIRT_LLM_CQ_LEN,
+				       &vdev->cq_dma, GFP_KERNEL);
+	if (!vdev->cq)
+		return -ENOMEM;
+
 	vdev->input = dmam_alloc_coherent(dev, VIRT_LLM_TEST_LEN,
 					  &vdev->input_dma, GFP_KERNEL);
 	if (!vdev->input)
@@ -130,6 +160,35 @@ static int virt_llm_alloc_dma(struct virt_llm_dev *vdev)
 	if (!vdev->input_b)
 		return -ENOMEM;
 
+	return 0;
+}
+
+static int virt_llm_check_cq(struct virt_llm_dev *vdev, u32 command_id,
+			     u32 opcode, u32 backend, u32 status, u32 result)
+{
+	u32 cq_tail = ioread32(vdev->bar + VIRT_LLM_REG_CQ_TAIL);
+	struct virt_llm_cpl *cpl;
+
+	if (!cq_tail)
+		return -EIO;
+
+	cpl = &vdev->cq[(cq_tail - 1) % VIRT_LLM_CQ_LEN];
+	if (le32_to_cpu(cpl->command_id) != command_id ||
+	    le32_to_cpu(cpl->opcode) != opcode ||
+	    le32_to_cpu(cpl->backend) != backend ||
+	    le32_to_cpu(cpl->status) != status ||
+	    le32_to_cpu(cpl->result) != result) {
+		dev_err(&vdev->pdev->dev,
+			"bad cq entry tail=%u cmd=%u/0x%x opcode=0x%x/0x%x backend=%u/%u status=0x%x/0x%x result=0x%x/0x%x\n",
+			cq_tail, le32_to_cpu(cpl->command_id), command_id,
+			le32_to_cpu(cpl->opcode), opcode,
+			le32_to_cpu(cpl->backend), backend,
+			le32_to_cpu(cpl->status), status,
+			le32_to_cpu(cpl->result), result);
+		return -EIO;
+	}
+
+	iowrite32(cq_tail, vdev->bar + VIRT_LLM_REG_CQ_HEAD);
 	return 0;
 }
 
@@ -194,6 +253,8 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 		return -EOPNOTSUPP;
 	if (!(features & VIRT_LLM_FEATURE_QCTRL))
 		return -EOPNOTSUPP;
+	if (!(features & VIRT_LLM_FEATURE_CQ))
+		return -EOPNOTSUPP;
 
 	for (int i = 0; i < VIRT_LLM_TEST_LEN; i++) {
 		vdev->input[i] = i;
@@ -207,10 +268,14 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 	desc->input_addr = cpu_to_le64(vdev->input_dma);
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
 	desc->len = cpu_to_le32(VIRT_LLM_TEST_LEN);
+	desc->rsvd0 = cpu_to_le32(1);
 
 	iowrite32(lower_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_LO);
 	iowrite32(upper_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_HI);
 	iowrite32(VIRT_LLM_QUEUE_LEN, vdev->bar + VIRT_LLM_REG_Q_SIZE);
+	iowrite32(lower_32_bits(vdev->cq_dma), vdev->bar + VIRT_LLM_REG_CQ_LO);
+	iowrite32(upper_32_bits(vdev->cq_dma), vdev->bar + VIRT_LLM_REG_CQ_HI);
+	iowrite32(VIRT_LLM_CQ_LEN, vdev->bar + VIRT_LLM_REG_CQ_SIZE);
 	iowrite32(VIRT_LLM_IRQ_ALL, vdev->bar + VIRT_LLM_REG_IRQ_MASK);
 	iowrite32(VIRT_LLM_Q_CTRL_ENABLE, vdev->bar + VIRT_LLM_REG_Q_CTRL);
 	if (!(ioread32(vdev->bar + VIRT_LLM_REG_Q_STATUS) & VIRT_LLM_Q_STATUS_EN))
@@ -238,6 +303,11 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 			le32_to_cpu(desc->result), expected_sum);
 		return -EIO;
 	}
+	ret = virt_llm_check_cq(vdev, 1, VIRT_LLM_OP_INFER,
+				VIRT_LLM_BACKEND_COMPAT, VIRT_LLM_DESC_COMPLETE,
+				expected_sum);
+	if (ret)
+		return ret;
 
 	dev_info(&vdev->pdev->dev,
 		 "dma inference ok: irq=%s queue=%pad input=%pad output=%pad len=%u checksum=0x%08x\n",
@@ -266,6 +336,7 @@ static int virt_llm_run_dma_copy_selftest(struct virt_llm_dev *vdev)
 	desc->input_addr = cpu_to_le64(vdev->input_dma);
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
 	desc->len = cpu_to_le32(VIRT_LLM_TEST_LEN);
+	desc->rsvd0 = cpu_to_le32(2);
 
 	ret = virt_llm_submit_tail(vdev, 2, "dma copy self-test");
 	if (ret)
@@ -288,6 +359,11 @@ static int virt_llm_run_dma_copy_selftest(struct virt_llm_dev *vdev)
 			return -EIO;
 		}
 	}
+	ret = virt_llm_check_cq(vdev, 2, VIRT_LLM_OP_DMA_COPY,
+				VIRT_LLM_BACKEND_DMA, VIRT_LLM_DESC_COMPLETE,
+				expected_sum);
+	if (ret)
+		return ret;
 
 	dev_info(&vdev->pdev->dev, "dma copy ok: len=%u checksum=0x%08x\n",
 		 VIRT_LLM_TEST_LEN, expected_sum);
@@ -321,6 +397,7 @@ static int virt_llm_run_vector_add_selftest(struct virt_llm_dev *vdev)
 	desc->input_addr = cpu_to_le64(vdev->input_dma);
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
 	desc->len = cpu_to_le32(count);
+	desc->rsvd0 = cpu_to_le32(3);
 	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
 
 	ret = virt_llm_submit_tail(vdev, 3, "vector add self-test");
@@ -346,6 +423,11 @@ static int virt_llm_run_vector_add_selftest(struct virt_llm_dev *vdev)
 			return -EIO;
 		}
 	}
+	ret = virt_llm_check_cq(vdev, 3, VIRT_LLM_OP_VEC_ADD_U32,
+				VIRT_LLM_BACKEND_VECTOR,
+				VIRT_LLM_DESC_COMPLETE, expected_sum);
+	if (ret)
+		return ret;
 
 	dev_info(&vdev->pdev->dev, "vector add ok: count=%u checksum=0x%08x\n",
 		 count, expected_sum);
@@ -380,6 +462,7 @@ static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
 	desc->input_addr = cpu_to_le64(vdev->input_dma);
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
+	desc->rsvd0 = cpu_to_le32(4);
 	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
 	desc->rsvd2 = cpu_to_le64(dims);
 
@@ -404,6 +487,11 @@ static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 			return -EIO;
 		}
 	}
+	ret = virt_llm_check_cq(vdev, 4, VIRT_LLM_OP_GEMM_U32,
+				VIRT_LLM_BACKEND_TENSOR,
+				VIRT_LLM_DESC_COMPLETE, expected_sum);
+	if (ret)
+		return ret;
 
 	dev_info(&vdev->pdev->dev, "gemm ok: m=2 n=2 k=2 checksum=0x%08x\n",
 		 expected_sum);
@@ -422,6 +510,7 @@ static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 	memset(desc, 0, sizeof(*desc));
 	desc->opcode = cpu_to_le32(VIRT_LLM_OP_BAD_TEST);
 	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+	desc->rsvd0 = cpu_to_le32(5);
 
 	ret = virt_llm_submit_tail(vdev, head + 1, "error self-test");
 	if (ret)
@@ -437,6 +526,10 @@ static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 			le32_to_cpu(desc->status), q_status, q_error);
 		return -EIO;
 	}
+	ret = virt_llm_check_cq(vdev, 5, VIRT_LLM_OP_BAD_TEST, U32_MAX,
+				VIRT_LLM_DESC_UNSUPP, 0);
+	if (ret)
+		return ret;
 
 	dev_info(&vdev->pdev->dev,
 		 "error path ok: desc_status=0x%08x q_status=0x%08x q_error=%u\n",
@@ -509,8 +602,9 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	ret = virt_llm_alloc_dma(vdev);
 	if (ret)
 		return ret;
-	dev_info(&pdev->dev, "dma buffers: queue=%pad input=%pad output=%pad\n",
-		 &vdev->queue_dma, &vdev->input_dma, &vdev->output_dma);
+	dev_info(&pdev->dev, "dma buffers: queue=%pad cq=%pad input=%pad output=%pad\n",
+		 &vdev->queue_dma, &vdev->cq_dma, &vdev->input_dma,
+		 &vdev->output_dma);
 	dev_info(&pdev->dev, "dma input_b=%pad\n", &vdev->input_b_dma);
 
 	ret = virt_llm_request_irq(vdev);
