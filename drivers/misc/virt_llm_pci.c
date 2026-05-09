@@ -26,6 +26,13 @@
 #define VIRT_LLM_REG_IRQ_STS    0x28
 #define VIRT_LLM_REG_IRQ_MASK   0x2c
 #define VIRT_LLM_REG_COMMAND    0x30
+#define VIRT_LLM_REG_ABI        0x34
+#define VIRT_LLM_REG_Q_MAX      0x38
+#define VIRT_LLM_REG_XFER_MAX   0x3c
+#define VIRT_LLM_REG_IRQ_VEC    0x40
+#define VIRT_LLM_REG_Q_CTRL     0x44
+#define VIRT_LLM_REG_Q_STATUS   0x48
+#define VIRT_LLM_REG_Q_ERROR    0x4c
 
 #define VIRT_LLM_MAGIC          0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_STATUS_XOR     0xa5a5a5a5u
@@ -34,10 +41,21 @@
 #define VIRT_LLM_FEATURE_QUEUE  BIT(0)
 #define VIRT_LLM_FEATURE_MSI    BIT(1)
 #define VIRT_LLM_FEATURE_MSIX   BIT(2)
+#define VIRT_LLM_FEATURE_QCTRL  BIT(3)
 #define VIRT_LLM_IRQ_COMPLETE   BIT(0)
+#define VIRT_LLM_IRQ_ERROR      BIT(1)
+#define VIRT_LLM_IRQ_ALL        (VIRT_LLM_IRQ_COMPLETE | VIRT_LLM_IRQ_ERROR)
 #define VIRT_LLM_CMD_KICK       1
 #define VIRT_LLM_OP_INFER       1
+#define VIRT_LLM_OP_BAD_TEST    0xffff
+#define VIRT_LLM_DESC_F_READY   BIT(0)
 #define VIRT_LLM_DESC_COMPLETE  1
+#define VIRT_LLM_DESC_UNSUPP    0x80000002u
+#define VIRT_LLM_Q_CTRL_ENABLE  BIT(0)
+#define VIRT_LLM_Q_CTRL_RESET   BIT(1)
+#define VIRT_LLM_Q_STATUS_EN    BIT(0)
+#define VIRT_LLM_Q_STATUS_ERR   BIT(1)
+#define VIRT_LLM_Q_ERR_OPCODE   3
 #define VIRT_LLM_QUEUE_LEN      4
 #define VIRT_LLM_TEST_LEN       64
 
@@ -74,10 +92,10 @@ static irqreturn_t virt_llm_irq(int irq, void *data)
 	struct virt_llm_dev *vdev = data;
 	u32 status = ioread32(vdev->bar + VIRT_LLM_REG_IRQ_STS);
 
-	if (!(status & VIRT_LLM_IRQ_COMPLETE))
+	if (!(status & VIRT_LLM_IRQ_ALL))
 		return IRQ_NONE;
 
-	iowrite32(VIRT_LLM_IRQ_COMPLETE, vdev->bar + VIRT_LLM_REG_IRQ_STS);
+	iowrite32(status & VIRT_LLM_IRQ_ALL, vdev->bar + VIRT_LLM_REG_IRQ_STS);
 	complete(&vdev->done);
 	return IRQ_HANDLED;
 }
@@ -140,6 +158,8 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 
 	if (!(features & VIRT_LLM_FEATURE_QUEUE))
 		return -EOPNOTSUPP;
+	if (!(features & VIRT_LLM_FEATURE_QCTRL))
+		return -EOPNOTSUPP;
 
 	for (int i = 0; i < VIRT_LLM_TEST_LEN; i++) {
 		vdev->input[i] = i;
@@ -149,6 +169,7 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 
 	memset(vdev->queue, 0, sizeof(*vdev->queue) * VIRT_LLM_QUEUE_LEN);
 	desc->opcode = cpu_to_le32(VIRT_LLM_OP_INFER);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
 	desc->input_addr = cpu_to_le64(vdev->input_dma);
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
 	desc->len = cpu_to_le32(VIRT_LLM_TEST_LEN);
@@ -157,7 +178,10 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 	iowrite32(lower_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_LO);
 	iowrite32(upper_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_HI);
 	iowrite32(VIRT_LLM_QUEUE_LEN, vdev->bar + VIRT_LLM_REG_Q_SIZE);
-	iowrite32(VIRT_LLM_IRQ_COMPLETE, vdev->bar + VIRT_LLM_REG_IRQ_MASK);
+	iowrite32(VIRT_LLM_IRQ_ALL, vdev->bar + VIRT_LLM_REG_IRQ_MASK);
+	iowrite32(VIRT_LLM_Q_CTRL_ENABLE, vdev->bar + VIRT_LLM_REG_Q_CTRL);
+	if (!(ioread32(vdev->bar + VIRT_LLM_REG_Q_STATUS) & VIRT_LLM_Q_STATUS_EN))
+		return -EIO;
 
 	dma_wmb();
 	iowrite32(1, vdev->bar + VIRT_LLM_REG_Q_TAIL);
@@ -202,6 +226,50 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 	return 0;
 }
 
+static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
+{
+	struct virt_llm_desc *desc = &vdev->queue[1];
+	unsigned long timeout;
+	u32 q_error;
+	u32 q_status;
+
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(VIRT_LLM_OP_BAD_TEST);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+
+	reinit_completion(&vdev->done);
+	dma_wmb();
+	iowrite32(2, vdev->bar + VIRT_LLM_REG_Q_TAIL);
+	iowrite32(VIRT_LLM_CMD_KICK, vdev->bar + VIRT_LLM_REG_COMMAND);
+
+	timeout = wait_for_completion_timeout(&vdev->done, msecs_to_jiffies(5000));
+	if (!timeout) {
+		dev_err(&vdev->pdev->dev, "error self-test timed out irq_status=0x%08x head=%u tail=%u\n",
+			ioread32(vdev->bar + VIRT_LLM_REG_IRQ_STS),
+			ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD),
+			ioread32(vdev->bar + VIRT_LLM_REG_Q_TAIL));
+		return -ETIMEDOUT;
+	}
+
+	dma_rmb();
+	q_status = ioread32(vdev->bar + VIRT_LLM_REG_Q_STATUS);
+	q_error = ioread32(vdev->bar + VIRT_LLM_REG_Q_ERROR);
+	if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_UNSUPP ||
+	    !(q_status & VIRT_LLM_Q_STATUS_ERR) ||
+	    q_error != VIRT_LLM_Q_ERR_OPCODE) {
+		dev_err(&vdev->pdev->dev,
+			"bad error self-test desc=0x%08x q_status=0x%08x q_error=%u\n",
+			le32_to_cpu(desc->status), q_status, q_error);
+		return -EIO;
+	}
+
+	dev_info(&vdev->pdev->dev,
+		 "error path ok: desc_status=0x%08x q_status=0x%08x q_error=%u\n",
+		 le32_to_cpu(desc->status), q_status, q_error);
+	iowrite32(VIRT_LLM_Q_CTRL_RESET, vdev->bar + VIRT_LLM_REG_Q_CTRL);
+	return 0;
+}
+
 static int virt_llm_pci_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *id)
 {
@@ -209,6 +277,10 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	void __iomem *bar;
 	u32 magic;
 	u32 version;
+	u32 abi;
+	u32 q_max;
+	u32 xfer_max;
+	u32 irq_vec;
 	u32 status;
 	u32 expected;
 	int ret;
@@ -232,6 +304,10 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 
 	magic = ioread32(bar + VIRT_LLM_REG_MAGIC);
 	version = ioread32(bar + VIRT_LLM_REG_VERSION);
+	abi = ioread32(bar + VIRT_LLM_REG_ABI);
+	q_max = ioread32(bar + VIRT_LLM_REG_Q_MAX);
+	xfer_max = ioread32(bar + VIRT_LLM_REG_XFER_MAX);
+	irq_vec = ioread32(bar + VIRT_LLM_REG_IRQ_VEC);
 	if (magic != VIRT_LLM_MAGIC) {
 		dev_err(&pdev->dev, "bad magic: 0x%08x\n", magic);
 		return -ENODEV;
@@ -271,9 +347,16 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 		return ret;
 	}
 
+	ret = virt_llm_run_error_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
 	dev_info(&pdev->dev,
-		 "probe ok: magic=0x%08x version=%u doorbell=0x%08x status=0x%08x\n",
-		 magic, version, VIRT_LLM_TEST_DOORBELL, status);
+		 "probe ok: magic=0x%08x version=%u abi=%u q_max=%u xfer_max=%u irq_vec=%u doorbell=0x%08x status=0x%08x\n",
+		 magic, version, abi, q_max, xfer_max, irq_vec,
+		 VIRT_LLM_TEST_DOORBELL, status);
 
 	return 0;
 }
