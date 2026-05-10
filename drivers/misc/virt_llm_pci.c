@@ -622,6 +622,88 @@ static int virt_llm_run_pooling_selftest(struct virt_llm_dev *vdev)
 	return 0;
 }
 
+static int virt_llm_run_batch_wrap_selftest(struct virt_llm_dev *vdev)
+{
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 cq_tail = ioread32(vdev->bar + VIRT_LLM_REG_CQ_TAIL);
+	u32 expected_sum[4] = { 0 };
+	int ret;
+
+	for (int d = 0; d < 4; d++) {
+		u32 idx = (head + d) % VIRT_LLM_QUEUE_LEN;
+		struct virt_llm_desc *desc = &vdev->queue[idx];
+		u32 offset = d * 16;
+
+		for (int i = 0; i < 8; i++) {
+			u8 val = 0x20 + d * 8 + i;
+
+			vdev->input[offset + i] = val;
+			vdev->output[offset + i] = 0;
+			expected_sum[d] += val;
+		}
+
+		memset(desc, 0, sizeof(*desc));
+		desc->opcode = cpu_to_le32(VIRT_LLM_OP_DMA_COPY);
+		desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+		desc->input_addr = cpu_to_le64(vdev->input_dma + offset);
+		desc->output_addr = cpu_to_le64(vdev->output_dma + offset);
+		desc->len = cpu_to_le32(8);
+		desc->rsvd0 = cpu_to_le32(20 + d);
+	}
+
+	ret = virt_llm_submit_tail(vdev, head + 4, "batch wrap self-test");
+	if (ret)
+		return ret;
+
+	for (int d = 0; d < 4; d++) {
+		u32 idx = (head + d) % VIRT_LLM_QUEUE_LEN;
+		struct virt_llm_desc *desc = &vdev->queue[idx];
+		struct virt_llm_cpl *cpl = &vdev->cq[(cq_tail + d) % VIRT_LLM_CQ_LEN];
+		u32 offset = d * 16;
+
+		if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_COMPLETE ||
+		    le32_to_cpu(desc->result) != expected_sum[d]) {
+			dev_err(&vdev->pdev->dev,
+				"batch desc %d bad status=0x%08x result=0x%08x expected=0x%08x\n",
+				d, le32_to_cpu(desc->status),
+				le32_to_cpu(desc->result), expected_sum[d]);
+			return -EIO;
+		}
+
+		for (int i = 0; i < 8; i++) {
+			if (vdev->output[offset + i] != vdev->input[offset + i]) {
+				dev_err(&vdev->pdev->dev,
+					"batch copy mismatch desc=%d byte=%d got=0x%02x expected=0x%02x\n",
+					d, i, vdev->output[offset + i],
+					vdev->input[offset + i]);
+				return -EIO;
+			}
+		}
+
+		if (le32_to_cpu(cpl->command_id) != 20 + d ||
+		    le32_to_cpu(cpl->opcode) != VIRT_LLM_OP_DMA_COPY ||
+		    le32_to_cpu(cpl->backend) != VIRT_LLM_BACKEND_DMA ||
+		    le32_to_cpu(cpl->status) != VIRT_LLM_DESC_COMPLETE ||
+		    le32_to_cpu(cpl->result) != expected_sum[d]) {
+			dev_err(&vdev->pdev->dev,
+				"batch cq %d bad cmd=%u opcode=0x%x backend=%u status=0x%x result=0x%x\n",
+				d, le32_to_cpu(cpl->command_id),
+				le32_to_cpu(cpl->opcode),
+				le32_to_cpu(cpl->backend),
+				le32_to_cpu(cpl->status),
+				le32_to_cpu(cpl->result));
+			return -EIO;
+		}
+	}
+
+	iowrite32(cq_tail + 4, vdev->bar + VIRT_LLM_REG_CQ_HEAD);
+	dev_info(&vdev->pdev->dev,
+		 "batch wrap ok: q_head=%u->%u cq_tail=%u->%u descriptors=4\n",
+		 head, ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD),
+		 cq_tail, ioread32(vdev->bar + VIRT_LLM_REG_CQ_TAIL));
+	return 0;
+}
+
 static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 {
 	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
@@ -766,6 +848,12 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	}
 
 	ret = virt_llm_run_gemm_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_batch_wrap_selftest(vdev);
 	if (ret) {
 		pci_free_irq_vectors(pdev);
 		return ret;
