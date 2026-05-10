@@ -42,6 +42,13 @@
 #define VIRT_LLM_REG_SCALAR_KERNELS     0x68
 #define VIRT_LLM_REG_SCALAR_LAST_KERNEL 0x6c
 #define VIRT_LLM_REG_SCALAR_LAST_OPCODE 0x70
+#define VIRT_LLM_REG_KERNEL_INDEX       0x74
+#define VIRT_LLM_REG_KERNEL_ID          0x78
+#define VIRT_LLM_REG_KERNEL_OPCODE      0x7c
+#define VIRT_LLM_REG_KERNEL_ABI         0x80
+#define VIRT_LLM_REG_KERNEL_ENTRY       0x84
+#define VIRT_LLM_REG_KERNEL_SIZE        0x88
+#define VIRT_LLM_REG_KERNEL_CHECKSUM    0x8c
 
 #define VIRT_LLM_MAGIC          0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_STATUS_XOR     0xa5a5a5a5u
@@ -88,6 +95,51 @@
 #define VIRT_LLM_KERNEL_DOT_U32 2
 #define VIRT_LLM_KERNEL_SOFTMAX_Q16 3
 #define VIRT_LLM_KERNEL_POOL_MAX_U32 4
+#define VIRT_LLM_KERNEL_ABI_VERSION 1
+
+struct virt_llm_kernel_expected {
+	u32 kernel_id;
+	u32 opcode;
+	u32 abi;
+	u32 entry;
+	u32 size;
+	u32 checksum;
+};
+
+static const struct virt_llm_kernel_expected virt_llm_expected_kernels[] = {
+	{
+		.kernel_id = VIRT_LLM_KERNEL_VEC_ADD_U32,
+		.opcode = VIRT_LLM_OP_VEC_ADD_U32,
+		.abi = VIRT_LLM_KERNEL_ABI_VERSION,
+		.entry = 0x1000,
+		.size = 64,
+		.checksum = 0xadd00101,
+	},
+	{
+		.kernel_id = VIRT_LLM_KERNEL_DOT_U32,
+		.opcode = VIRT_LLM_OP_DOT_U32,
+		.abi = VIRT_LLM_KERNEL_ABI_VERSION,
+		.entry = 0x1100,
+		.size = 72,
+		.checksum = 0xd0700103,
+	},
+	{
+		.kernel_id = VIRT_LLM_KERNEL_SOFTMAX_Q16,
+		.opcode = VIRT_LLM_OP_SOFTMAX_Q16,
+		.abi = VIRT_LLM_KERNEL_ABI_VERSION,
+		.entry = 0x1200,
+		.size = 96,
+		.checksum = 0x50170101,
+	},
+	{
+		.kernel_id = VIRT_LLM_KERNEL_POOL_MAX_U32,
+		.opcode = VIRT_LLM_OP_POOL_MAX_U32,
+		.abi = VIRT_LLM_KERNEL_ABI_VERSION,
+		.entry = 0x1300,
+		.size = 80,
+		.checksum = 0x90010102,
+	},
+};
 
 struct virt_llm_desc {
 	__le32 opcode;
@@ -879,6 +931,69 @@ static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 	return 0;
 }
 
+static int virt_llm_run_kernel_table_selftest(struct virt_llm_dev *vdev,
+					     u32 scalar_kernels)
+{
+	if (scalar_kernels != ARRAY_SIZE(virt_llm_expected_kernels)) {
+		dev_err(&vdev->pdev->dev,
+			"kernel count mismatch got=%u expected=%zu\n",
+			scalar_kernels, ARRAY_SIZE(virt_llm_expected_kernels));
+		return -EIO;
+	}
+
+	for (u32 i = 0; i < ARRAY_SIZE(virt_llm_expected_kernels); i++) {
+		const struct virt_llm_kernel_expected *expected;
+		u32 kernel_id;
+		u32 opcode;
+		u32 abi;
+		u32 entry;
+		u32 size;
+		u32 checksum;
+
+		expected = &virt_llm_expected_kernels[i];
+		iowrite32(i, vdev->bar + VIRT_LLM_REG_KERNEL_INDEX);
+		kernel_id = ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_ID);
+		opcode = ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_OPCODE);
+		abi = ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_ABI);
+		entry = ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_ENTRY);
+		size = ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_SIZE);
+		checksum = ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_CHECKSUM);
+
+		if (kernel_id != expected->kernel_id ||
+		    opcode != expected->opcode ||
+		    abi != expected->abi ||
+		    entry != expected->entry ||
+		    size != expected->size ||
+		    checksum != expected->checksum) {
+			dev_err(&vdev->pdev->dev,
+				"kernel table[%u] mismatch id=%u opcode=0x%x abi=%u entry=0x%x size=%u checksum=0x%x\n",
+				i, kernel_id, opcode, abi, entry, size,
+				checksum);
+			return -EIO;
+		}
+	}
+
+	iowrite32(scalar_kernels, vdev->bar + VIRT_LLM_REG_KERNEL_INDEX);
+	if (ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_ID) ||
+	    ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_OPCODE) ||
+	    ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_ABI) ||
+	    ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_ENTRY) ||
+	    ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_SIZE) ||
+	    ioread32(vdev->bar + VIRT_LLM_REG_KERNEL_CHECKSUM)) {
+		dev_err(&vdev->pdev->dev,
+			"out-of-range kernel metadata did not read as zero\n");
+		return -EIO;
+	}
+	iowrite32(0, vdev->bar + VIRT_LLM_REG_KERNEL_INDEX);
+
+	dev_info(&vdev->pdev->dev,
+		 "kernel table ok: kernels=%u abi=%u first_entry=0x%08x last_entry=0x%08x\n",
+		 scalar_kernels, VIRT_LLM_KERNEL_ABI_VERSION,
+		 virt_llm_expected_kernels[0].entry,
+		 virt_llm_expected_kernels[ARRAY_SIZE(virt_llm_expected_kernels) - 1].entry);
+	return 0;
+}
+
 static int virt_llm_pci_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *id)
 {
@@ -953,6 +1068,12 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	ret = virt_llm_request_irq(vdev);
 	if (ret)
 		return ret;
+
+	ret = virt_llm_run_kernel_table_selftest(vdev, scalar_kernels);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
 
 	ret = virt_llm_run_dma_selftest(vdev);
 	if (ret) {
