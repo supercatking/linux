@@ -62,6 +62,7 @@
 #define VIRT_LLM_OP_VEC_ADD_U32 0x0100
 #define VIRT_LLM_OP_SOFTMAX_Q16 0x0101
 #define VIRT_LLM_OP_POOL_MAX_U32 0x0102
+#define VIRT_LLM_OP_DOT_U32     0x0103
 #define VIRT_LLM_OP_GEMM_U32    0x0200
 #define VIRT_LLM_OP_BAD_TEST    0xffff
 #define VIRT_LLM_DESC_F_READY   BIT(0)
@@ -83,6 +84,7 @@
 #define VIRT_LLM_BACKEND_SCALAR 4
 
 #define VIRT_LLM_KERNEL_VEC_ADD_U32 1
+#define VIRT_LLM_KERNEL_DOT_U32 2
 #define VIRT_LLM_KERNEL_SOFTMAX_Q16 3
 #define VIRT_LLM_KERNEL_POOL_MAX_U32 4
 
@@ -515,6 +517,56 @@ static int virt_llm_run_gemm_selftest(struct virt_llm_dev *vdev)
 	return 0;
 }
 
+static int virt_llm_run_dot_selftest(struct virt_llm_dev *vdev)
+{
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 idx = head % VIRT_LLM_QUEUE_LEN;
+	struct virt_llm_desc *desc = &vdev->queue[idx];
+	__le32 *a = (__le32 *)vdev->input;
+	__le32 *b = (__le32 *)vdev->input_b;
+	u32 avec[] = { 1, 2, 3, 4 };
+	u32 bvec[] = { 5, 6, 7, 8 };
+	u32 expected = 70;
+	int ret;
+
+	for (int i = 0; i < ARRAY_SIZE(avec); i++) {
+		a[i] = cpu_to_le32(avec[i]);
+		b[i] = cpu_to_le32(bvec[i]);
+	}
+
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(VIRT_LLM_OP_DOT_U32);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+	desc->input_addr = cpu_to_le64(vdev->input_dma);
+	desc->len = cpu_to_le32(ARRAY_SIZE(avec));
+	desc->rsvd0 = cpu_to_le32(8);
+	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
+	desc->rsvd3 = cpu_to_le64(VIRT_LLM_KERNEL_DOT_U32);
+
+	ret = virt_llm_submit_tail(vdev, head + 1, "dot self-test");
+	if (ret)
+		return ret;
+
+	if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_COMPLETE ||
+	    le32_to_cpu(desc->result) != expected) {
+		dev_err(&vdev->pdev->dev,
+			"dot bad status=0x%08x result=%u expected=%u\n",
+			le32_to_cpu(desc->status), le32_to_cpu(desc->result),
+			expected);
+		return -EIO;
+	}
+
+	ret = virt_llm_check_cq(vdev, 8, VIRT_LLM_OP_DOT_U32,
+				VIRT_LLM_BACKEND_SCALAR,
+				VIRT_LLM_DESC_COMPLETE, expected);
+	if (ret)
+		return ret;
+
+	dev_info(&vdev->pdev->dev, "dot u32 ok: count=%zu result=%u\n",
+		 ARRAY_SIZE(avec), expected);
+	return 0;
+}
+
 static int virt_llm_run_softmax_selftest(struct virt_llm_dev *vdev)
 {
 	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
@@ -847,6 +899,12 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	}
 
 	ret = virt_llm_run_vector_add_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_dot_selftest(vdev);
 	if (ret) {
 		pci_free_irq_vectors(pdev);
 		return ret;
