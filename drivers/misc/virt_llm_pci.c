@@ -64,6 +64,7 @@
 #define VIRT_LLM_OP_POOL_MAX_U32 0x0102
 #define VIRT_LLM_OP_DOT_U32     0x0103
 #define VIRT_LLM_OP_GEMM_U32    0x0200
+#define VIRT_LLM_OP_CONV2D_U32  0x0201
 #define VIRT_LLM_OP_BAD_TEST    0xffff
 #define VIRT_LLM_DESC_F_READY   BIT(0)
 #define VIRT_LLM_DESC_COMPLETE  1
@@ -567,6 +568,73 @@ static int virt_llm_run_dot_selftest(struct virt_llm_dev *vdev)
 	return 0;
 }
 
+static int virt_llm_run_conv2d_selftest(struct virt_llm_dev *vdev)
+{
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 idx = head % VIRT_LLM_QUEUE_LEN;
+	struct virt_llm_desc *desc = &vdev->queue[idx];
+	__le32 *input = (__le32 *)vdev->input;
+	__le32 *kernel = (__le32 *)vdev->input_b;
+	__le32 *out = (__le32 *)vdev->output;
+	u32 input_values[] = { 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+	u32 kernel_values[] = { 1, 0, 0, 1 };
+	u32 expected[] = { 6, 8, 12, 14 };
+	u64 in_dims = 3 | (3ULL << 16) | (2ULL << 32) | (2ULL << 48);
+	u64 out_dims = 2 | (2ULL << 16);
+	u32 expected_sum = 0;
+	int ret;
+
+	for (int i = 0; i < ARRAY_SIZE(input_values); i++)
+		input[i] = cpu_to_le32(input_values[i]);
+	for (int i = 0; i < ARRAY_SIZE(kernel_values); i++)
+		kernel[i] = cpu_to_le32(kernel_values[i]);
+	memset(vdev->output, 0, VIRT_LLM_TEST_LEN);
+	for (int i = 0; i < ARRAY_SIZE(expected); i++)
+		expected_sum += expected[i];
+
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(VIRT_LLM_OP_CONV2D_U32);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+	desc->input_addr = cpu_to_le64(vdev->input_dma);
+	desc->output_addr = cpu_to_le64(vdev->output_dma);
+	desc->rsvd0 = cpu_to_le32(9);
+	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
+	desc->rsvd2 = cpu_to_le64(in_dims);
+	desc->rsvd3 = cpu_to_le64(out_dims);
+
+	ret = virt_llm_submit_tail(vdev, head + 1, "conv2d self-test");
+	if (ret)
+		return ret;
+
+	if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_COMPLETE ||
+	    le32_to_cpu(desc->result) != expected_sum) {
+		dev_err(&vdev->pdev->dev,
+			"conv2d bad status=0x%08x result=0x%08x expected=0x%08x\n",
+			le32_to_cpu(desc->status), le32_to_cpu(desc->result),
+			expected_sum);
+		return -EIO;
+	}
+
+	for (int i = 0; i < ARRAY_SIZE(expected); i++) {
+		if (le32_to_cpu(out[i]) != expected[i]) {
+			dev_err(&vdev->pdev->dev,
+				"conv2d mismatch at %d got=%u expected=%u\n",
+				i, le32_to_cpu(out[i]), expected[i]);
+			return -EIO;
+		}
+	}
+	ret = virt_llm_check_cq(vdev, 9, VIRT_LLM_OP_CONV2D_U32,
+				VIRT_LLM_BACKEND_TENSOR,
+				VIRT_LLM_DESC_COMPLETE, expected_sum);
+	if (ret)
+		return ret;
+
+	dev_info(&vdev->pdev->dev,
+		 "conv2d ok: input=3x3 kernel=2x2 output=2x2 checksum=0x%08x\n",
+		 expected_sum);
+	return 0;
+}
+
 static int virt_llm_run_softmax_selftest(struct virt_llm_dev *vdev)
 {
 	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
@@ -923,6 +991,12 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	}
 
 	ret = virt_llm_run_gemm_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_conv2d_selftest(vdev);
 	if (ret) {
 		pci_free_irq_vectors(pdev);
 		return ret;
