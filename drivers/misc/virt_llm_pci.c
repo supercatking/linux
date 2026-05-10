@@ -38,6 +38,10 @@
 #define VIRT_LLM_REG_CQ_HI      0x58
 #define VIRT_LLM_REG_CQ_HEAD    0x5c
 #define VIRT_LLM_REG_CQ_TAIL    0x60
+#define VIRT_LLM_REG_SCALAR_STATUS      0x64
+#define VIRT_LLM_REG_SCALAR_KERNELS     0x68
+#define VIRT_LLM_REG_SCALAR_LAST_KERNEL 0x6c
+#define VIRT_LLM_REG_SCALAR_LAST_OPCODE 0x70
 
 #define VIRT_LLM_MAGIC          0x4c4c4d31u /* "LLM1" */
 #define VIRT_LLM_STATUS_XOR     0xa5a5a5a5u
@@ -48,6 +52,7 @@
 #define VIRT_LLM_FEATURE_MSIX   BIT(2)
 #define VIRT_LLM_FEATURE_QCTRL  BIT(3)
 #define VIRT_LLM_FEATURE_CQ     BIT(4)
+#define VIRT_LLM_FEATURE_SCALAR BIT(5)
 #define VIRT_LLM_IRQ_COMPLETE   BIT(0)
 #define VIRT_LLM_IRQ_ERROR      BIT(1)
 #define VIRT_LLM_IRQ_ALL        (VIRT_LLM_IRQ_COMPLETE | VIRT_LLM_IRQ_ERROR)
@@ -75,6 +80,11 @@
 #define VIRT_LLM_BACKEND_DMA    1
 #define VIRT_LLM_BACKEND_VECTOR 2
 #define VIRT_LLM_BACKEND_TENSOR 3
+#define VIRT_LLM_BACKEND_SCALAR 4
+
+#define VIRT_LLM_KERNEL_VEC_ADD_U32 1
+#define VIRT_LLM_KERNEL_SOFTMAX_Q16 3
+#define VIRT_LLM_KERNEL_POOL_MAX_U32 4
 
 struct virt_llm_desc {
 	__le32 opcode;
@@ -257,6 +267,8 @@ static int virt_llm_run_dma_selftest(struct virt_llm_dev *vdev)
 		return -EOPNOTSUPP;
 	if (!(features & VIRT_LLM_FEATURE_CQ))
 		return -EOPNOTSUPP;
+	if (!(features & VIRT_LLM_FEATURE_SCALAR))
+		return -EOPNOTSUPP;
 
 	for (int i = 0; i < VIRT_LLM_TEST_LEN; i++) {
 		vdev->input[i] = i;
@@ -401,6 +413,7 @@ static int virt_llm_run_vector_add_selftest(struct virt_llm_dev *vdev)
 	desc->len = cpu_to_le32(count);
 	desc->rsvd0 = cpu_to_le32(3);
 	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
+	desc->rsvd3 = cpu_to_le64(VIRT_LLM_KERNEL_VEC_ADD_U32);
 
 	ret = virt_llm_submit_tail(vdev, 3, "vector add self-test");
 	if (ret)
@@ -426,7 +439,7 @@ static int virt_llm_run_vector_add_selftest(struct virt_llm_dev *vdev)
 		}
 	}
 	ret = virt_llm_check_cq(vdev, 3, VIRT_LLM_OP_VEC_ADD_U32,
-				VIRT_LLM_BACKEND_VECTOR,
+				VIRT_LLM_BACKEND_SCALAR,
 				VIRT_LLM_DESC_COMPLETE, expected_sum);
 	if (ret)
 		return ret;
@@ -527,6 +540,7 @@ static int virt_llm_run_softmax_selftest(struct virt_llm_dev *vdev)
 	desc->output_addr = cpu_to_le64(vdev->output_dma);
 	desc->len = cpu_to_le32(ARRAY_SIZE(values));
 	desc->rsvd0 = cpu_to_le32(4);
+	desc->rsvd3 = cpu_to_le64(VIRT_LLM_KERNEL_SOFTMAX_Q16);
 
 	ret = virt_llm_submit_tail(vdev, head + 1, "softmax self-test");
 	if (ret)
@@ -551,7 +565,7 @@ static int virt_llm_run_softmax_selftest(struct virt_llm_dev *vdev)
 	}
 
 	ret = virt_llm_check_cq(vdev, 4, VIRT_LLM_OP_SOFTMAX_Q16,
-				VIRT_LLM_BACKEND_VECTOR,
+				VIRT_LLM_BACKEND_SCALAR,
 				VIRT_LLM_DESC_COMPLETE, expected_sum);
 	if (ret)
 		return ret;
@@ -588,6 +602,7 @@ static int virt_llm_run_pooling_selftest(struct virt_llm_dev *vdev)
 	desc->len = cpu_to_le32(ARRAY_SIZE(values));
 	desc->rsvd0 = cpu_to_le32(5);
 	desc->rsvd2 = cpu_to_le64(args);
+	desc->rsvd3 = cpu_to_le64(VIRT_LLM_KERNEL_POOL_MAX_U32);
 
 	ret = virt_llm_submit_tail(vdev, head + 1, "pooling self-test");
 	if (ret)
@@ -612,7 +627,7 @@ static int virt_llm_run_pooling_selftest(struct virt_llm_dev *vdev)
 	}
 
 	ret = virt_llm_check_cq(vdev, 5, VIRT_LLM_OP_POOL_MAX_U32,
-				VIRT_LLM_BACKEND_VECTOR,
+				VIRT_LLM_BACKEND_SCALAR,
 				VIRT_LLM_DESC_COMPLETE, expected_sum);
 	if (ret)
 		return ret;
@@ -755,6 +770,7 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	u32 q_max;
 	u32 xfer_max;
 	u32 irq_vec;
+	u32 scalar_kernels;
 	u32 status;
 	u32 expected;
 	int ret;
@@ -782,6 +798,7 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	q_max = ioread32(bar + VIRT_LLM_REG_Q_MAX);
 	xfer_max = ioread32(bar + VIRT_LLM_REG_XFER_MAX);
 	irq_vec = ioread32(bar + VIRT_LLM_REG_IRQ_VEC);
+	scalar_kernels = ioread32(bar + VIRT_LLM_REG_SCALAR_KERNELS);
 	if (magic != VIRT_LLM_MAGIC) {
 		dev_err(&pdev->dev, "bad magic: 0x%08x\n", magic);
 		return -ENODEV;
@@ -866,8 +883,10 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	}
 
 	dev_info(&pdev->dev,
-		 "probe ok: magic=0x%08x version=%u abi=%u q_max=%u xfer_max=%u irq_vec=%u doorbell=0x%08x status=0x%08x\n",
-		 magic, version, abi, q_max, xfer_max, irq_vec,
+		 "probe ok: magic=0x%08x version=%u abi=%u q_max=%u xfer_max=%u irq_vec=%u scalar_kernels=%u last_kernel=%u last_opcode=0x%08x doorbell=0x%08x status=0x%08x\n",
+		 magic, version, abi, q_max, xfer_max, irq_vec, scalar_kernels,
+		 ioread32(bar + VIRT_LLM_REG_SCALAR_LAST_KERNEL),
+		 ioread32(bar + VIRT_LLM_REG_SCALAR_LAST_OPCODE),
 		 VIRT_LLM_TEST_DOORBELL, status);
 
 	return 0;
