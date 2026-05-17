@@ -76,11 +76,13 @@
 #define VIRT_LLM_DESC_F_READY   BIT(0)
 #define VIRT_LLM_DESC_COMPLETE  1
 #define VIRT_LLM_DESC_UNSUPP    0x80000002u
+#define VIRT_LLM_DESC_BAD_KERNEL 0x80000004u
 #define VIRT_LLM_Q_CTRL_ENABLE  BIT(0)
 #define VIRT_LLM_Q_CTRL_RESET   BIT(1)
 #define VIRT_LLM_Q_STATUS_EN    BIT(0)
 #define VIRT_LLM_Q_STATUS_ERR   BIT(1)
 #define VIRT_LLM_Q_ERR_OPCODE   3
+#define VIRT_LLM_Q_ERR_KERNEL   4
 #define VIRT_LLM_QUEUE_LEN      4
 #define VIRT_LLM_CQ_LEN         8
 #define VIRT_LLM_TEST_LEN       64
@@ -931,6 +933,62 @@ static int virt_llm_run_error_selftest(struct virt_llm_dev *vdev)
 	return 0;
 }
 
+static int virt_llm_run_bad_kernel_selftest(struct virt_llm_dev *vdev,
+					   u32 kernel_selector,
+					   u32 command_id,
+					   const char *label)
+{
+	u32 head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	u32 idx = head % VIRT_LLM_QUEUE_LEN;
+	struct virt_llm_desc *desc = &vdev->queue[idx];
+	__le32 *a = (__le32 *)vdev->input;
+	__le32 *b = (__le32 *)vdev->input_b;
+	u32 q_error;
+	u32 q_status;
+	int ret;
+
+	for (int i = 0; i < 4; i++) {
+		a[i] = cpu_to_le32(i + 1);
+		b[i] = cpu_to_le32(10 + i);
+	}
+	memset(vdev->output, 0, VIRT_LLM_TEST_LEN);
+
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(VIRT_LLM_OP_VEC_ADD_U32);
+	desc->flags = cpu_to_le32(VIRT_LLM_DESC_F_READY);
+	desc->input_addr = cpu_to_le64(vdev->input_dma);
+	desc->output_addr = cpu_to_le64(vdev->output_dma);
+	desc->len = cpu_to_le32(4);
+	desc->rsvd0 = cpu_to_le32(command_id);
+	desc->rsvd1 = cpu_to_le64(vdev->input_b_dma);
+	desc->rsvd3 = cpu_to_le64(kernel_selector);
+
+	ret = virt_llm_submit_tail(vdev, head + 1, label);
+	if (ret)
+		return ret;
+
+	q_status = ioread32(vdev->bar + VIRT_LLM_REG_Q_STATUS);
+	q_error = ioread32(vdev->bar + VIRT_LLM_REG_Q_ERROR);
+	if (le32_to_cpu(desc->status) != VIRT_LLM_DESC_BAD_KERNEL ||
+	    !(q_status & VIRT_LLM_Q_STATUS_ERR) ||
+	    q_error != VIRT_LLM_Q_ERR_KERNEL) {
+		dev_err(&vdev->pdev->dev,
+			"%s bad status desc=0x%08x q_status=0x%08x q_error=%u\n",
+			label, le32_to_cpu(desc->status), q_status, q_error);
+		return -EIO;
+	}
+	ret = virt_llm_check_cq(vdev, command_id, VIRT_LLM_OP_VEC_ADD_U32,
+				VIRT_LLM_BACKEND_SCALAR,
+				VIRT_LLM_DESC_BAD_KERNEL, 0);
+	if (ret)
+		return ret;
+
+	dev_info(&vdev->pdev->dev,
+		 "%s ok: desc_status=0x%08x q_error=%u\n",
+		 label, le32_to_cpu(desc->status), q_error);
+	return 0;
+}
+
 static int virt_llm_run_kernel_table_selftest(struct virt_llm_dev *vdev,
 					     u32 scalar_kernels)
 {
@@ -1124,6 +1182,22 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	}
 
 	ret = virt_llm_run_batch_wrap_selftest(vdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_bad_kernel_selftest(vdev, 0x00ff, 10,
+					       "bad kernel id self-test");
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	ret = virt_llm_run_bad_kernel_selftest(vdev,
+					       VIRT_LLM_KERNEL_VEC_ADD_U32 |
+					       (2U << 16), 11,
+					       "bad kernel abi self-test");
 	if (ret) {
 		pci_free_irq_vectors(pdev);
 		return ret;
