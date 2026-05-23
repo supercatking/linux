@@ -18,6 +18,7 @@ typedef unsigned long long u64;
 #define VIRT_LLM_IOCTL_MAGIC 'L'
 #define VIRT_LLM_OP_GEMM_U32       0x0200
 #define VIRT_LLM_OP_ATTENTION_Q16  0x0202
+#define VIRT_LLM_OP_MODEL_LOAD     0x0300
 #define VIRT_LLM_OP_MODEL_QUERY    0x0301
 #define VIRT_LLM_OP_EMBED_LOOKUP_F32 0x0310
 #define VIRT_LLM_OP_RMSNORM_F32    0x0311
@@ -352,7 +353,8 @@ static int run_model_query(int fd, struct virt_llm_user_buffer *in_buf, u32 *in,
 		return -1;
 	}
 	if (cpl.command_id != 2100 || cpl.backend != VIRT_LLM_BACKEND_DMA ||
-	    cpl.status != VIRT_LLM_DESC_COMPLETE || query->layers != 24 ||
+	    cpl.status != VIRT_LLM_DESC_COMPLETE || query->model_loaded != 1 ||
+	    query->layers != 24 ||
 	    query->hidden_size != 896 || query->attention_heads != 14 ||
 	    query->kv_heads != 2 || query->head_dim != 64 ||
 	    query->intermediate_size != 4864 || query->vocab_size != 151936) {
@@ -363,6 +365,40 @@ static int run_model_query(int fd, struct virt_llm_user_buffer *in_buf, u32 *in,
 	print_dec(query->hidden_size);
 	puts_(" layers=");
 	print_dec(query->layers);
+	puts_("\n");
+	return 0;
+}
+
+static int run_model_load(int fd, struct virt_llm_user_buffer *in_buf, u32 *in,
+			  struct virt_llm_user_buffer *out_buf, u32 *out)
+{
+	struct virt_llm_user_desc desc;
+	struct virt_llm_user_cpl cpl;
+
+	memset_(in, 0, PAGE_SIZE);
+	memset_(out, 0, PAGE_SIZE);
+	memset_(&desc, 0, sizeof(desc));
+	desc.opcode = VIRT_LLM_OP_MODEL_LOAD;
+	desc.input_handle = in_buf->handle;
+	desc.output_handle = out_buf->handle;
+	desc.command_id = 2099;
+	if (syscall3(29, fd, VIRT_LLM_IOCTL_SUBMIT_DESC, (long)&desc) < 0) {
+		puts_("virt-llm-test model load submit failed\n");
+		return -1;
+	}
+	if (wait_cq(fd, &cpl) < 0) {
+		puts_("virt-llm-test model load wait failed\n");
+		return -1;
+	}
+	if (cpl.command_id != 2099 || cpl.backend != VIRT_LLM_BACKEND_DMA ||
+	    cpl.status != VIRT_LLM_DESC_COMPLETE || cpl.result != 218) {
+		puts_("virt-llm-test model load mismatch result=");
+		print_hex(cpl.result);
+		puts_("\n");
+		return -1;
+	}
+	puts_("virt-llm-test model load ok: tensors=");
+	print_dec(cpl.result);
 	puts_("\n");
 	return 0;
 }
@@ -728,6 +764,7 @@ void _start(void)
 		 alloc_buffer(fd, &c_buf, &c) == 0 &&
 		 alloc_buffer(fd, &out_buf, &out) == 0 &&
 		 run_info(fd) == 0 &&
+		 run_model_load(fd, &a_buf, a, &out_buf, out) == 0 &&
 		 run_model_query(fd, &a_buf, a, &out_buf, out) == 0 &&
 		 run_gemm(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
 		 run_attention(fd, &a_buf, a, &b_buf, b, &c_buf, c, &out_buf, out) == 0 &&
