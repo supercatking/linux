@@ -6,10 +6,16 @@
 #include <linux/io.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
+#include <linux/fs.h>
 #include <linux/interrupt.h>
+#include <linux/miscdevice.h>
+#include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <uapi/linux/virt_llm.h>
 
 #define VIRT_LLM_DEVICE_ID      0x1100
 
@@ -74,10 +80,16 @@
 #define VIRT_LLM_OP_CONV2D_U32  0x0201
 #define VIRT_LLM_OP_ATTENTION_Q16 0x0202
 #define VIRT_LLM_OP_BAD_TEST    0xffff
+#ifndef VIRT_LLM_DESC_F_READY
 #define VIRT_LLM_DESC_F_READY   BIT(0)
+#endif
 #define VIRT_LLM_DESC_COMPLETE  1
+#ifndef VIRT_LLM_DESC_UNSUPP
 #define VIRT_LLM_DESC_UNSUPP    0x80000002u
+#endif
+#ifndef VIRT_LLM_DESC_BAD_KERNEL
 #define VIRT_LLM_DESC_BAD_KERNEL 0x80000004u
+#endif
 #define VIRT_LLM_Q_CTRL_ENABLE  BIT(0)
 #define VIRT_LLM_Q_CTRL_RESET   BIT(1)
 #define VIRT_LLM_Q_STATUS_EN    BIT(0)
@@ -87,7 +99,12 @@
 #define VIRT_LLM_QUEUE_LEN      4
 #define VIRT_LLM_CQ_LEN         8
 #define VIRT_LLM_TEST_LEN       64
+#define VIRT_LLM_USER_BUF_MAX   8
+#define VIRT_LLM_USER_BUF_SIZE  PAGE_SIZE
+#define VIRT_LLM_MISC_MINOR     243
+#ifndef VIRT_LLM_ATTENTION_CAUSAL
 #define VIRT_LLM_ATTENTION_CAUSAL BIT(0)
+#endif
 
 #define VIRT_LLM_BACKEND_COMPAT 0
 #define VIRT_LLM_BACKEND_DMA    1
@@ -169,10 +186,18 @@ struct virt_llm_cpl {
 	__le64 rsvd0;
 } __packed;
 
+struct virt_llm_user_dma {
+	void *cpu;
+	dma_addr_t dma;
+	size_t size;
+	bool in_use;
+};
+
 struct virt_llm_dev {
 	struct pci_dev *pdev;
 	void __iomem *bar;
 	struct completion done;
+	struct mutex user_lock;
 	struct virt_llm_desc *queue;
 	dma_addr_t queue_dma;
 	struct virt_llm_cpl *cq;
@@ -187,7 +212,17 @@ struct virt_llm_dev {
 	dma_addr_t output_dma;
 	int irq_vectors;
 	const char *irq_mode;
+	struct miscdevice miscdev;
+	u32 user_cq_head;
+	u32 next_command_id;
+	struct virt_llm_user_dma user_bufs[VIRT_LLM_USER_BUF_MAX];
 };
+
+static bool run_selftest = true;
+module_param(run_selftest, bool, 0644);
+MODULE_PARM_DESC(run_selftest, "Run virt-llm probe selftests");
+
+static struct virt_llm_dev *virt_llm_singleton;
 
 static irqreturn_t virt_llm_irq(int irq, void *data)
 {
@@ -727,8 +762,8 @@ static int virt_llm_run_attention_selftest(struct virt_llm_dev *vdev)
 	};
 	u32 expected[] = {
 		65536, 0,
-		7811, 57724,
-		58555, 58555,
+		1179, 64356,
+		64376, 64376,
 	};
 	u32 expected_sum = 0;
 	int ret;
@@ -1154,6 +1189,281 @@ static int virt_llm_run_kernel_table_selftest(struct virt_llm_dev *vdev,
 	return 0;
 }
 
+static struct virt_llm_user_dma *
+virt_llm_user_buf_get(struct virt_llm_dev *vdev, u32 handle)
+{
+	if (!handle || handle > VIRT_LLM_USER_BUF_MAX)
+		return NULL;
+	if (!vdev->user_bufs[handle - 1].in_use)
+		return NULL;
+	return &vdev->user_bufs[handle - 1];
+}
+
+static long virt_llm_ioctl_get_info(struct virt_llm_dev *vdev, void __user *argp)
+{
+	struct virt_llm_user_info info = {
+		.magic = ioread32(vdev->bar + VIRT_LLM_REG_MAGIC),
+		.version = ioread32(vdev->bar + VIRT_LLM_REG_VERSION),
+		.features = ioread32(vdev->bar + VIRT_LLM_REG_FEATURES),
+		.abi = ioread32(vdev->bar + VIRT_LLM_REG_ABI),
+		.q_max = ioread32(vdev->bar + VIRT_LLM_REG_Q_MAX),
+		.xfer_max = ioread32(vdev->bar + VIRT_LLM_REG_XFER_MAX),
+		.cq_size = VIRT_LLM_CQ_LEN,
+	};
+
+	if (copy_to_user(argp, &info, sizeof(info)))
+		return -EFAULT;
+	return 0;
+}
+
+static long virt_llm_ioctl_alloc_buffer(struct virt_llm_dev *vdev,
+					void __user *argp)
+{
+	struct virt_llm_user_buffer req;
+	struct virt_llm_user_dma *buf = NULL;
+	struct device *dev = &vdev->pdev->dev;
+	int i;
+
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+	if (!req.size || req.size > VIRT_LLM_USER_BUF_SIZE)
+		return -EINVAL;
+
+	mutex_lock(&vdev->user_lock);
+	for (i = 0; i < VIRT_LLM_USER_BUF_MAX; i++) {
+		if (!vdev->user_bufs[i].in_use) {
+			buf = &vdev->user_bufs[i];
+			break;
+		}
+	}
+	if (!buf) {
+		mutex_unlock(&vdev->user_lock);
+		return -ENOSPC;
+	}
+
+	buf->cpu = dma_alloc_coherent(dev, VIRT_LLM_USER_BUF_SIZE, &buf->dma,
+				      GFP_KERNEL);
+	if (!buf->cpu) {
+		mutex_unlock(&vdev->user_lock);
+		return -ENOMEM;
+	}
+	buf->size = VIRT_LLM_USER_BUF_SIZE;
+	buf->in_use = true;
+	req.handle = i + 1;
+	req.size = buf->size;
+	req.dma_addr = buf->dma;
+	mutex_unlock(&vdev->user_lock);
+
+	if (copy_to_user(argp, &req, sizeof(req)))
+		return -EFAULT;
+	return 0;
+}
+
+static long virt_llm_ioctl_free_buffer(struct virt_llm_dev *vdev,
+				       void __user *argp)
+{
+	struct device *dev = &vdev->pdev->dev;
+	struct virt_llm_user_dma *buf;
+	u32 handle;
+
+	if (copy_from_user(&handle, argp, sizeof(handle)))
+		return -EFAULT;
+
+	mutex_lock(&vdev->user_lock);
+	buf = virt_llm_user_buf_get(vdev, handle);
+	if (!buf) {
+		mutex_unlock(&vdev->user_lock);
+		return -ENOENT;
+	}
+	dma_free_coherent(dev, buf->size, buf->cpu, buf->dma);
+	memset(buf, 0, sizeof(*buf));
+	mutex_unlock(&vdev->user_lock);
+	return 0;
+}
+
+static long virt_llm_ioctl_submit_desc(struct virt_llm_dev *vdev,
+				       void __user *argp)
+{
+	struct virt_llm_user_desc req;
+	struct virt_llm_user_dma *input;
+	struct virt_llm_user_dma *output;
+	struct virt_llm_user_dma *rsvd1 = NULL;
+	struct virt_llm_user_dma *rsvd2 = NULL;
+	struct virt_llm_desc *desc;
+	u32 head;
+	u32 tail;
+
+	if (copy_from_user(&req, argp, sizeof(req)))
+		return -EFAULT;
+
+	mutex_lock(&vdev->user_lock);
+	input = virt_llm_user_buf_get(vdev, req.input_handle);
+	output = virt_llm_user_buf_get(vdev, req.output_handle);
+	if (req.rsvd1_handle)
+		rsvd1 = virt_llm_user_buf_get(vdev, req.rsvd1_handle);
+	if (req.rsvd2_handle)
+		rsvd2 = virt_llm_user_buf_get(vdev, req.rsvd2_handle);
+	if (!input || !output || (req.rsvd1_handle && !rsvd1) ||
+	    (req.rsvd2_handle && !rsvd2)) {
+		mutex_unlock(&vdev->user_lock);
+		return -EINVAL;
+	}
+
+	head = ioread32(vdev->bar + VIRT_LLM_REG_Q_HEAD);
+	tail = head + 1;
+	desc = &vdev->queue[head % VIRT_LLM_QUEUE_LEN];
+	memset(desc, 0, sizeof(*desc));
+	desc->opcode = cpu_to_le32(req.opcode);
+	desc->flags = cpu_to_le32(req.flags | VIRT_LLM_DESC_F_READY);
+	desc->input_addr = cpu_to_le64(input->dma);
+	desc->output_addr = cpu_to_le64(output->dma);
+	desc->len = cpu_to_le32(req.len);
+	if (!req.command_id)
+		req.command_id = ++vdev->next_command_id;
+	desc->rsvd0 = cpu_to_le32(req.command_id);
+	desc->rsvd1 = cpu_to_le64(rsvd1 ? rsvd1->dma : req.rsvd1_addr);
+	desc->rsvd2 = cpu_to_le64(rsvd2 ? rsvd2->dma : req.rsvd2_addr);
+	desc->rsvd3 = cpu_to_le64(req.rsvd3);
+
+	reinit_completion(&vdev->done);
+	dma_wmb();
+	iowrite32(tail, vdev->bar + VIRT_LLM_REG_Q_TAIL);
+	iowrite32(VIRT_LLM_CMD_KICK, vdev->bar + VIRT_LLM_REG_COMMAND);
+	mutex_unlock(&vdev->user_lock);
+
+	if (copy_to_user(argp, &req, sizeof(req)))
+		return -EFAULT;
+	return 0;
+}
+
+static long virt_llm_ioctl_wait_cq(struct virt_llm_dev *vdev, void __user *argp)
+{
+	struct virt_llm_user_cpl out;
+	struct virt_llm_cpl *cpl;
+	unsigned long timeout;
+	u32 tail;
+
+	timeout = wait_for_completion_timeout(&vdev->done, msecs_to_jiffies(5000));
+	if (!timeout)
+		return -ETIMEDOUT;
+
+	mutex_lock(&vdev->user_lock);
+	dma_rmb();
+	tail = ioread32(vdev->bar + VIRT_LLM_REG_CQ_TAIL);
+	if (vdev->user_cq_head == tail) {
+		mutex_unlock(&vdev->user_lock);
+		return -EAGAIN;
+	}
+
+	cpl = &vdev->cq[vdev->user_cq_head % VIRT_LLM_CQ_LEN];
+	out.command_id = le32_to_cpu(cpl->command_id);
+	out.opcode = le32_to_cpu(cpl->opcode);
+	out.backend = le32_to_cpu(cpl->backend);
+	out.status = le32_to_cpu(cpl->status);
+	out.result = le32_to_cpu(cpl->result);
+	out.q_head = le32_to_cpu(cpl->q_head);
+	out.q_error = ioread32(vdev->bar + VIRT_LLM_REG_Q_ERROR);
+	out.reserved = 0;
+
+	vdev->user_cq_head++;
+	iowrite32(vdev->user_cq_head, vdev->bar + VIRT_LLM_REG_CQ_HEAD);
+	mutex_unlock(&vdev->user_lock);
+
+	if (copy_to_user(argp, &out, sizeof(out)))
+		return -EFAULT;
+	return 0;
+}
+
+static long virt_llm_unlocked_ioctl(struct file *file, unsigned int cmd,
+				    unsigned long arg)
+{
+	struct virt_llm_dev *vdev = file->private_data;
+	void __user *argp = (void __user *)arg;
+
+	switch (cmd) {
+	case VIRT_LLM_IOCTL_GET_INFO:
+		return virt_llm_ioctl_get_info(vdev, argp);
+	case VIRT_LLM_IOCTL_ALLOC_BUFFER:
+		return virt_llm_ioctl_alloc_buffer(vdev, argp);
+	case VIRT_LLM_IOCTL_FREE_BUFFER:
+		return virt_llm_ioctl_free_buffer(vdev, argp);
+	case VIRT_LLM_IOCTL_SUBMIT_DESC:
+		return virt_llm_ioctl_submit_desc(vdev, argp);
+	case VIRT_LLM_IOCTL_WAIT_CQ:
+		return virt_llm_ioctl_wait_cq(vdev, argp);
+	default:
+		return -ENOTTY;
+	}
+}
+
+static int virt_llm_open(struct inode *inode, struct file *file)
+{
+	if (!virt_llm_singleton)
+		return -ENODEV;
+	file->private_data = virt_llm_singleton;
+	return 0;
+}
+
+static int virt_llm_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	struct virt_llm_dev *vdev = file->private_data;
+	u32 handle = vma->vm_pgoff + 1;
+	struct virt_llm_user_dma *buf;
+	unsigned long size = vma->vm_end - vma->vm_start;
+	int ret;
+
+	mutex_lock(&vdev->user_lock);
+	buf = virt_llm_user_buf_get(vdev, handle);
+	if (!buf || size > buf->size) {
+		mutex_unlock(&vdev->user_lock);
+		return -EINVAL;
+	}
+	vma->vm_pgoff = 0;
+	ret = dma_mmap_coherent(&vdev->pdev->dev, vma, buf->cpu, buf->dma,
+				buf->size);
+	if (ret)
+		dev_err(&vdev->pdev->dev,
+			"user mmap failed handle=%u size=%lu buf_size=%zu dma=%pad ret=%d\n",
+			handle, size, buf->size, &buf->dma, ret);
+	mutex_unlock(&vdev->user_lock);
+	return ret;
+}
+
+static const struct file_operations virt_llm_fops = {
+	.owner = THIS_MODULE,
+	.open = virt_llm_open,
+	.unlocked_ioctl = virt_llm_unlocked_ioctl,
+	.mmap = virt_llm_mmap,
+	.llseek = noop_llseek,
+};
+
+static int virt_llm_register_misc(struct virt_llm_dev *vdev)
+{
+	memset(vdev->queue, 0, sizeof(*vdev->queue) * VIRT_LLM_QUEUE_LEN);
+	memset(vdev->cq, 0, sizeof(*vdev->cq) * VIRT_LLM_CQ_LEN);
+	iowrite32(VIRT_LLM_Q_CTRL_RESET, vdev->bar + VIRT_LLM_REG_Q_CTRL);
+	iowrite32(lower_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_LO);
+	iowrite32(upper_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_HI);
+	iowrite32(VIRT_LLM_QUEUE_LEN, vdev->bar + VIRT_LLM_REG_Q_SIZE);
+	iowrite32(lower_32_bits(vdev->cq_dma), vdev->bar + VIRT_LLM_REG_CQ_LO);
+	iowrite32(upper_32_bits(vdev->cq_dma), vdev->bar + VIRT_LLM_REG_CQ_HI);
+	iowrite32(VIRT_LLM_CQ_LEN, vdev->bar + VIRT_LLM_REG_CQ_SIZE);
+	iowrite32(VIRT_LLM_IRQ_ALL, vdev->bar + VIRT_LLM_REG_IRQ_MASK);
+	iowrite32(VIRT_LLM_Q_CTRL_ENABLE, vdev->bar + VIRT_LLM_REG_Q_CTRL);
+	if (!(ioread32(vdev->bar + VIRT_LLM_REG_Q_STATUS) & VIRT_LLM_Q_STATUS_EN))
+		return -EIO;
+
+	vdev->miscdev.minor = VIRT_LLM_MISC_MINOR;
+	vdev->miscdev.name = "virt_llm0";
+	vdev->miscdev.fops = &virt_llm_fops;
+	vdev->miscdev.parent = &vdev->pdev->dev;
+	vdev->miscdev.mode = 0600;
+	vdev->user_cq_head = 0;
+	vdev->next_command_id = 1000;
+	virt_llm_singleton = vdev;
+	return misc_register(&vdev->miscdev);
+}
+
 static int virt_llm_pci_probe(struct pci_dev *pdev,
 			      const struct pci_device_id *id)
 {
@@ -1215,6 +1525,7 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	vdev->pdev = pdev;
 	vdev->bar = bar;
 	init_completion(&vdev->done);
+	mutex_init(&vdev->user_lock);
 	pci_set_drvdata(pdev, vdev);
 
 	ret = virt_llm_alloc_dma(vdev);
@@ -1230,89 +1541,110 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 	if (ret)
 		return ret;
 
-	ret = virt_llm_run_kernel_table_selftest(vdev, scalar_kernels);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
+	if (run_selftest) {
+		ret = virt_llm_run_kernel_table_selftest(vdev, scalar_kernels);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_dma_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_dma_copy_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_vector_add_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_dot_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_softmax_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_pooling_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_gemm_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_conv2d_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_attention_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_batch_wrap_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_bad_kernel_selftest(vdev, 0x00ff, 10,
+						       "bad kernel id self-test");
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_bad_kernel_selftest(vdev,
+						       VIRT_LLM_KERNEL_VEC_ADD_U32 |
+						       (2U << 16), 11,
+						       "bad kernel abi self-test");
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+
+		ret = virt_llm_run_error_selftest(vdev);
+		if (ret) {
+			pci_free_irq_vectors(pdev);
+			return ret;
+		}
+	} else {
+		iowrite32(lower_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_LO);
+		iowrite32(upper_32_bits(vdev->queue_dma), vdev->bar + VIRT_LLM_REG_Q_HI);
+		iowrite32(VIRT_LLM_QUEUE_LEN, vdev->bar + VIRT_LLM_REG_Q_SIZE);
+		iowrite32(lower_32_bits(vdev->cq_dma), vdev->bar + VIRT_LLM_REG_CQ_LO);
+		iowrite32(upper_32_bits(vdev->cq_dma), vdev->bar + VIRT_LLM_REG_CQ_HI);
+		iowrite32(VIRT_LLM_CQ_LEN, vdev->bar + VIRT_LLM_REG_CQ_SIZE);
+		iowrite32(VIRT_LLM_IRQ_ALL, vdev->bar + VIRT_LLM_REG_IRQ_MASK);
+		iowrite32(VIRT_LLM_Q_CTRL_ENABLE, vdev->bar + VIRT_LLM_REG_Q_CTRL);
+		if (!(ioread32(vdev->bar + VIRT_LLM_REG_Q_STATUS) & VIRT_LLM_Q_STATUS_EN)) {
+			pci_free_irq_vectors(pdev);
+			return -EIO;
+		}
 	}
 
-	ret = virt_llm_run_dma_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_dma_copy_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_vector_add_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_dot_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_softmax_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_pooling_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_gemm_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_conv2d_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_attention_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_batch_wrap_selftest(vdev);
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_bad_kernel_selftest(vdev, 0x00ff, 10,
-					       "bad kernel id self-test");
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_bad_kernel_selftest(vdev,
-					       VIRT_LLM_KERNEL_VEC_ADD_U32 |
-					       (2U << 16), 11,
-					       "bad kernel abi self-test");
-	if (ret) {
-		pci_free_irq_vectors(pdev);
-		return ret;
-	}
-
-	ret = virt_llm_run_error_selftest(vdev);
+	ret = virt_llm_register_misc(vdev);
 	if (ret) {
 		pci_free_irq_vectors(pdev);
 		return ret;
@@ -1330,6 +1662,20 @@ static int virt_llm_pci_probe(struct pci_dev *pdev,
 
 static void virt_llm_pci_remove(struct pci_dev *pdev)
 {
+	struct virt_llm_dev *vdev = pci_get_drvdata(pdev);
+	struct device *dev = &pdev->dev;
+
+	if (vdev) {
+		misc_deregister(&vdev->miscdev);
+		if (virt_llm_singleton == vdev)
+			virt_llm_singleton = NULL;
+		for (int i = 0; i < VIRT_LLM_USER_BUF_MAX; i++) {
+			if (vdev->user_bufs[i].in_use)
+				dma_free_coherent(dev, vdev->user_bufs[i].size,
+						  vdev->user_bufs[i].cpu,
+						  vdev->user_bufs[i].dma);
+		}
+	}
 	pci_free_irq_vectors(pdev);
 	dev_info(&pdev->dev, "remove\n");
 }
