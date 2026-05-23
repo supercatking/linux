@@ -19,14 +19,23 @@ typedef unsigned long long u64;
 #define VIRT_LLM_OP_GEMM_U32       0x0200
 #define VIRT_LLM_OP_ATTENTION_Q16  0x0202
 #define VIRT_LLM_OP_MODEL_QUERY    0x0301
+#define VIRT_LLM_OP_EMBED_LOOKUP_F32 0x0310
+#define VIRT_LLM_OP_RMSNORM_F32    0x0311
+#define VIRT_LLM_OP_ROPE_F32       0x0312
 #define VIRT_LLM_OP_GEMM_F32       0x0313
+#define VIRT_LLM_OP_ADD_F32        0x0314
+#define VIRT_LLM_OP_SWIGLU_F32     0x0315
+#define VIRT_LLM_OP_QWEN_GQA_ATTENTION_F32 0x0316
+#define VIRT_LLM_OP_ARGMAX_F32     0x0318
 #define VIRT_LLM_DESC_COMPLETE     1
 #define VIRT_LLM_BACKEND_DMA       1
+#define VIRT_LLM_BACKEND_VECTOR    2
 #define VIRT_LLM_BACKEND_TENSOR    3
 #define VIRT_LLM_ATTENTION_CAUSAL  (1U << 0)
 #define VIRT_LLM_TENSOR_ABI_VERSION 1
 #define VIRT_LLM_DTYPE_F32         2
 #define VIRT_LLM_REQ_DATA_OFFSET   128
+#define VIRT_LLM_TENSOR_F_CAUSAL   (1U << 0)
 
 #define _IOC_NRBITS     8
 #define _IOC_TYPEBITS   8
@@ -416,6 +425,198 @@ static int run_gemm_f32(int fd, struct virt_llm_user_buffer *a_buf, u32 *a_raw,
 	return 0;
 }
 
+static void init_req(struct virt_llm_tensor_req *req)
+{
+	memset_(req, 0, sizeof(*req));
+	req->abi = VIRT_LLM_TENSOR_ABI_VERSION;
+	req->dtype = VIRT_LLM_DTYPE_F32;
+}
+
+static int submit_tensor(int fd, u32 opcode, u32 backend, u32 command_id,
+			 struct virt_llm_user_buffer *a_buf,
+			 struct virt_llm_user_buffer *b_buf,
+			 struct virt_llm_user_buffer *c_buf,
+			 struct virt_llm_user_buffer *out_buf,
+			 struct virt_llm_user_cpl *cpl)
+{
+	struct virt_llm_user_desc desc;
+
+	memset_(&desc, 0, sizeof(desc));
+	desc.opcode = opcode;
+	desc.input_handle = a_buf->handle;
+	desc.output_handle = out_buf->handle;
+	desc.len = sizeof(struct virt_llm_tensor_req);
+	desc.command_id = command_id;
+	if (b_buf)
+		desc.rsvd1_handle = b_buf->handle;
+	if (c_buf)
+		desc.rsvd2_handle = c_buf->handle;
+	if (syscall3(29, fd, VIRT_LLM_IOCTL_SUBMIT_DESC, (long)&desc) < 0)
+		return -1;
+	if (wait_cq(fd, cpl) < 0)
+		return -1;
+	return cpl->command_id == command_id && cpl->backend == backend &&
+	       cpl->status == VIRT_LLM_DESC_COMPLETE ? 0 : -1;
+}
+
+static int run_embed_f32(int fd, struct virt_llm_user_buffer *a_buf, u32 *a_raw,
+			 struct virt_llm_user_buffer *b_buf, u32 *b_raw,
+			 struct virt_llm_user_buffer *out_buf, u32 *out_raw)
+{
+	struct virt_llm_tensor_req *req = (struct virt_llm_tensor_req *)a_raw;
+	u32 *tokens = (u32 *)((unsigned char *)a_raw + VIRT_LLM_REQ_DATA_OFFSET);
+	u32 *embedding = b_raw;
+	struct virt_llm_user_cpl cpl;
+	u32 expected[] = { 0x40400000, 0x40800000, 0x3f800000, 0x40000000 };
+
+	memset_(a_raw, 0, PAGE_SIZE);
+	memset_(b_raw, 0, PAGE_SIZE);
+	memset_(out_raw, 0, PAGE_SIZE);
+	init_req(req);
+	req->rank = 2;
+	req->dims[0] = 2;
+	req->dims[1] = 2;
+	req->dims[2] = 3;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	tokens[0] = 1;
+	tokens[1] = 0;
+	embedding[0] = 0x3f800000; embedding[1] = 0x40000000;
+	embedding[2] = 0x40400000; embedding[3] = 0x40800000;
+	embedding[4] = 0x40a00000; embedding[5] = 0x40c00000;
+	if (submit_tensor(fd, VIRT_LLM_OP_EMBED_LOOKUP_F32, VIRT_LLM_BACKEND_VECTOR,
+			  2110, a_buf, b_buf, 0, out_buf, &cpl) < 0)
+		return -1;
+	for (unsigned int i = 0; i < 4; i++)
+		if (out_raw[i] != expected[i])
+			return -1;
+	puts_("virt-llm-test embed f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+	return 0;
+}
+
+static int run_simple_vector_f32(int fd, struct virt_llm_user_buffer *a_buf,
+				 u32 *a_raw, struct virt_llm_user_buffer *b_buf,
+				 u32 *b_raw, struct virt_llm_user_buffer *c_buf,
+				 u32 *c_raw, struct virt_llm_user_buffer *out_buf,
+				 u32 *out_raw)
+{
+	struct virt_llm_tensor_req *req = (struct virt_llm_tensor_req *)a_raw;
+	u32 *a = (u32 *)((unsigned char *)a_raw + VIRT_LLM_REQ_DATA_OFFSET);
+	struct virt_llm_user_cpl cpl;
+
+	memset_(a_raw, 0, PAGE_SIZE);
+	memset_(b_raw, 0, PAGE_SIZE);
+	memset_(c_raw, 0, PAGE_SIZE);
+	memset_(out_raw, 0, PAGE_SIZE);
+	init_req(req);
+	req->rank = 2;
+	req->dims[0] = 2;
+	req->dims[1] = 2;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	req->input2_offset = 0;
+	a[0] = 0x3f800000; a[1] = 0x40000000;
+	a[2] = 0x40400000; a[3] = 0x40800000;
+	b_raw[0] = 0x40a00000; b_raw[1] = 0x40c00000;
+	b_raw[2] = 0x40e00000; b_raw[3] = 0x41000000;
+	if (submit_tensor(fd, VIRT_LLM_OP_ADD_F32, VIRT_LLM_BACKEND_VECTOR,
+			  2111, a_buf, b_buf, 0, out_buf, &cpl) < 0)
+		return -1;
+	if (out_raw[0] != 0x40c00000 || out_raw[1] != 0x41000000 ||
+	    out_raw[2] != 0x41200000 || out_raw[3] != 0x41400000)
+		return -1;
+	puts_("virt-llm-test add f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+
+	memset_(out_raw, 0, PAGE_SIZE);
+	memset_(b_raw, 0, PAGE_SIZE);
+	if (submit_tensor(fd, VIRT_LLM_OP_SWIGLU_F32, VIRT_LLM_BACKEND_VECTOR,
+			  2112, a_buf, b_buf, 0, out_buf, &cpl) < 0)
+		return -1;
+	for (unsigned int i = 0; i < 4; i++)
+		if (out_raw[i] != 0)
+			return -1;
+	puts_("virt-llm-test swiglu f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+
+	memset_(out_raw, 0, PAGE_SIZE);
+	init_req(req);
+	req->rank = 1;
+	req->dims[0] = 4;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	a[0] = 0xbf800000; a[1] = 0x40400000;
+	a[2] = 0x40000000; a[3] = 0x3f800000;
+	if (submit_tensor(fd, VIRT_LLM_OP_ARGMAX_F32, VIRT_LLM_BACKEND_VECTOR,
+			  2113, a_buf, 0, 0, out_buf, &cpl) < 0)
+		return -1;
+	if (out_raw[0] != 1 || cpl.result != 1)
+		return -1;
+	puts_("virt-llm-test argmax f32 ok: token=");
+	print_dec(out_raw[0]);
+	puts_("\n");
+
+	memset_(out_raw, 0, PAGE_SIZE);
+	init_req(req);
+	req->rank = 2;
+	req->dims[0] = 1;
+	req->dims[1] = 2;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	b_raw[0] = 0x3f800000; b_raw[1] = 0x3f800000;
+	a[0] = 0; a[1] = 0;
+	if (submit_tensor(fd, VIRT_LLM_OP_RMSNORM_F32, VIRT_LLM_BACKEND_VECTOR,
+			  2114, a_buf, b_buf, 0, out_buf, &cpl) < 0)
+		return -1;
+	if (out_raw[0] != 0 || out_raw[1] != 0)
+		return -1;
+	puts_("virt-llm-test rmsnorm f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+
+	memset_(out_raw, 0, PAGE_SIZE);
+	init_req(req);
+	req->rank = 3;
+	req->dims[0] = 1;
+	req->dims[1] = 1;
+	req->dims[2] = 2;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	a[0] = 0x3f800000; a[1] = 0x40000000;
+	if (submit_tensor(fd, VIRT_LLM_OP_ROPE_F32, VIRT_LLM_BACKEND_VECTOR,
+			  2115, a_buf, 0, 0, out_buf, &cpl) < 0)
+		return -1;
+	if (out_raw[0] != a[0] || out_raw[1] != a[1])
+		return -1;
+	puts_("virt-llm-test rope f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+
+	memset_(out_raw, 0, PAGE_SIZE);
+	memset_(b_raw, 0, PAGE_SIZE);
+	memset_(c_raw, 0, PAGE_SIZE);
+	init_req(req);
+	req->rank = 4;
+	req->flags = VIRT_LLM_TENSOR_F_CAUSAL;
+	req->dims[0] = 1;
+	req->dims[1] = 1;
+	req->dims[2] = 1;
+	req->dims[3] = 2;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	a[0] = 0x3f800000; a[1] = 0;
+	b_raw[0] = 0x3f800000; b_raw[1] = 0;
+	c_raw[0] = 0x40400000; c_raw[1] = 0x40800000;
+	if (submit_tensor(fd, VIRT_LLM_OP_QWEN_GQA_ATTENTION_F32,
+			  VIRT_LLM_BACKEND_TENSOR, 2116, a_buf, b_buf, c_buf,
+			  out_buf, &cpl) < 0)
+		return -1;
+	if (out_raw[0] != c_raw[0] || out_raw[1] != c_raw[1])
+		return -1;
+	puts_("virt-llm-test qwen gqa f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+	return 0;
+}
+
 static int run_gemm(int fd, struct virt_llm_user_buffer *a_buf, u32 *a,
 		    struct virt_llm_user_buffer *b_buf, u32 *b,
 		    struct virt_llm_user_buffer *out_buf, u32 *out)
@@ -530,7 +731,10 @@ void _start(void)
 		 run_model_query(fd, &a_buf, a, &out_buf, out) == 0 &&
 		 run_gemm(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
 		 run_attention(fd, &a_buf, a, &b_buf, b, &c_buf, c, &out_buf, out) == 0 &&
-		 run_gemm_f32(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0)
+		 run_gemm_f32(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
+		 run_embed_f32(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
+		 run_simple_vector_f32(fd, &a_buf, a, &b_buf, b, &c_buf, c,
+				       &out_buf, out) == 0)
 		ok = 1;
 
 	if (ok) {
