@@ -396,7 +396,7 @@ static int run_model_load(int fd, struct virt_llm_user_buffer *in_buf, u32 *in,
 		return -1;
 	}
 	if (cpl.command_id != 2099 || cpl.backend != VIRT_LLM_BACKEND_DMA ||
-	    cpl.status != VIRT_LLM_DESC_COMPLETE || cpl.result != 218) {
+	    cpl.status != VIRT_LLM_DESC_COMPLETE || cpl.result != 290) {
 		puts_("virt-llm-test model load mismatch result=");
 		print_hex(cpl.result);
 		puts_("\n");

@@ -76,6 +76,9 @@
 #define VIRT_LLM_TENSOR_QWEN_GATE_PROJ  6
 #define VIRT_LLM_TENSOR_QWEN_UP_PROJ    7
 #define VIRT_LLM_TENSOR_QWEN_DOWN_PROJ  8
+#define VIRT_LLM_TENSOR_QWEN_Q_BIAS     9
+#define VIRT_LLM_TENSOR_QWEN_K_BIAS     10
+#define VIRT_LLM_TENSOR_QWEN_V_BIAS     11
 
 struct virt_llm_user_info {
 	__u32 magic;

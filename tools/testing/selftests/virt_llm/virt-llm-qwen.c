@@ -58,6 +58,9 @@ typedef unsigned long long u64;
 #define T_GATE_PROJ  6
 #define T_UP_PROJ    7
 #define T_DOWN_PROJ  8
+#define T_Q_BIAS     9
+#define T_K_BIAS     10
+#define T_V_BIAS     11
 
 #define _IOC_NRBITS     8
 #define _IOC_TYPEBITS   8
@@ -356,7 +359,15 @@ static int model_load(int fd, struct buf *a, struct buf *b)
 		return -1;
 	if (wait_cq(fd, &cpl) < 0)
 		return -1;
-	return cpl.status == VIRT_LLM_DESC_COMPLETE && cpl.result == 218 ? 0 : -1;
+	if (cpl.status != VIRT_LLM_DESC_COMPLETE || cpl.result != 290) {
+		puts_("qwen model load failed status=");
+		print_hex(cpl.status);
+		puts_(" tensors=");
+		print_dec(cpl.result);
+		puts_("\n");
+		return -1;
+	}
+	return 0;
 }
 
 static int embed(int fd, struct buf *tokens, struct buf *state,
@@ -410,6 +421,24 @@ static int gemm(int fd, u32 command, struct buf *in, struct buf *out,
 	req->input_offset = DATA_OFF;
 	req->output_offset = DATA_OFF;
 	return submit_desc(fd, opcode, VIRT_LLM_BACKEND_TENSOR, command, in, out, 0, 0);
+}
+
+static int gemm_bias(int fd, u32 command, struct buf *in, struct buf *out,
+		     u32 tensor_id, u32 bias_id, u32 m, u32 n, u32 k)
+{
+	struct virt_llm_tensor_req *req = (struct virt_llm_tensor_req *)in->ptr;
+
+	init_req(req);
+	req->rank = 2;
+	req->tensor_id = tensor_id;
+	req->aux_tensor_id = bias_id;
+	req->dims[0] = m;
+	req->dims[1] = n;
+	req->dims[2] = k;
+	req->input_offset = DATA_OFF;
+	req->output_offset = DATA_OFF;
+	return submit_desc(fd, VIRT_LLM_OP_GEMM_F32, VIRT_LLM_BACKEND_TENSOR,
+			   command, in, out, 0, 0);
 }
 
 static int lm_head(int fd, struct buf *in, struct buf *out, u32 seq)
@@ -516,16 +545,17 @@ static int run_qwen_forward(int fd, struct buf *b, u32 *token_ids, u32 seq,
 		if (rmsnorm(fd, 20, &b[0], &b[1],
 			    layer_tensor(layer, T_INPUT_NORM), seq) < 0)
 			return -1;
-		if (gemm(fd, 30, &b[1], &b[2], layer_tensor(layer, T_Q_PROJ),
-			 seq, QWEN_HIDDEN, QWEN_HIDDEN, VIRT_LLM_OP_GEMM_F32) < 0)
+		if (gemm_bias(fd, 30, &b[1], &b[2], layer_tensor(layer, T_Q_PROJ),
+			      layer_tensor(layer, T_Q_BIAS), seq, QWEN_HIDDEN,
+			      QWEN_HIDDEN) < 0)
 			return -1;
-		if (gemm(fd, 31, &b[1], &b[3], layer_tensor(layer, T_K_PROJ),
-			 seq, QWEN_KV_HEADS * QWEN_HEAD_DIM, QWEN_HIDDEN,
-			 VIRT_LLM_OP_GEMM_F32) < 0)
+		if (gemm_bias(fd, 31, &b[1], &b[3], layer_tensor(layer, T_K_PROJ),
+			      layer_tensor(layer, T_K_BIAS), seq,
+			      QWEN_KV_HEADS * QWEN_HEAD_DIM, QWEN_HIDDEN) < 0)
 			return -1;
-		if (gemm(fd, 32, &b[1], &b[4], layer_tensor(layer, T_V_PROJ),
-			 seq, QWEN_KV_HEADS * QWEN_HEAD_DIM, QWEN_HIDDEN,
-			 VIRT_LLM_OP_GEMM_F32) < 0)
+		if (gemm_bias(fd, 32, &b[1], &b[4], layer_tensor(layer, T_V_PROJ),
+			      layer_tensor(layer, T_V_BIAS), seq,
+			      QWEN_KV_HEADS * QWEN_HEAD_DIM, QWEN_HIDDEN) < 0)
 			return -1;
 		if (rope(fd, 33, &b[2], seq, QWEN_HEADS) < 0 ||
 		    rope(fd, 34, &b[3], seq, QWEN_KV_HEADS) < 0)
