@@ -18,9 +18,15 @@ typedef unsigned long long u64;
 #define VIRT_LLM_IOCTL_MAGIC 'L'
 #define VIRT_LLM_OP_GEMM_U32       0x0200
 #define VIRT_LLM_OP_ATTENTION_Q16  0x0202
+#define VIRT_LLM_OP_MODEL_QUERY    0x0301
+#define VIRT_LLM_OP_GEMM_F32       0x0313
 #define VIRT_LLM_DESC_COMPLETE     1
+#define VIRT_LLM_BACKEND_DMA       1
 #define VIRT_LLM_BACKEND_TENSOR    3
 #define VIRT_LLM_ATTENTION_CAUSAL  (1U << 0)
+#define VIRT_LLM_TENSOR_ABI_VERSION 1
+#define VIRT_LLM_DTYPE_F32         2
+#define VIRT_LLM_REQ_DATA_OFFSET   128
 
 #define _IOC_NRBITS     8
 #define _IOC_TYPEBITS   8
@@ -80,6 +86,41 @@ struct virt_llm_user_cpl {
 	u32 q_head;
 	u32 q_error;
 	u32 reserved;
+};
+
+struct virt_llm_tensor_req {
+	u32 abi;
+	u32 dtype;
+	u32 rank;
+	u32 flags;
+	u32 layer_id;
+	u32 tensor_id;
+	u32 aux_tensor_id;
+	u32 reserved0;
+	u32 dims[4];
+	u32 input_offset;
+	u32 weight_offset;
+	u32 aux_offset;
+	u32 output_offset;
+	u32 input2_offset;
+	u32 reserved1;
+	u64 scalar0_bits;
+	u64 scalar1_bits;
+};
+
+struct virt_llm_model_query {
+	u32 abi;
+	u32 model_loaded;
+	u32 layers;
+	u32 hidden_size;
+	u32 attention_heads;
+	u32 kv_heads;
+	u32 head_dim;
+	u32 intermediate_size;
+	u32 vocab_size;
+	u32 dtype;
+	u64 rope_theta_bits;
+	u64 rms_eps_bits;
 };
 
 #define VIRT_LLM_IOCTL_GET_INFO \
@@ -279,6 +320,102 @@ static int run_info(int fd)
 	return 0;
 }
 
+static int run_model_query(int fd, struct virt_llm_user_buffer *in_buf, u32 *in,
+			   struct virt_llm_user_buffer *out_buf, u32 *out)
+{
+	struct virt_llm_user_desc desc;
+	struct virt_llm_user_cpl cpl;
+	struct virt_llm_model_query *query = (struct virt_llm_model_query *)out;
+
+	memset_(in, 0, PAGE_SIZE);
+	memset_(out, 0, PAGE_SIZE);
+	memset_(&desc, 0, sizeof(desc));
+	desc.opcode = VIRT_LLM_OP_MODEL_QUERY;
+	desc.input_handle = in_buf->handle;
+	desc.output_handle = out_buf->handle;
+	desc.command_id = 2100;
+	if (syscall3(29, fd, VIRT_LLM_IOCTL_SUBMIT_DESC, (long)&desc) < 0) {
+		puts_("virt-llm-test model query submit failed\n");
+		return -1;
+	}
+	if (wait_cq(fd, &cpl) < 0) {
+		puts_("virt-llm-test model query wait failed\n");
+		return -1;
+	}
+	if (cpl.command_id != 2100 || cpl.backend != VIRT_LLM_BACKEND_DMA ||
+	    cpl.status != VIRT_LLM_DESC_COMPLETE || query->layers != 24 ||
+	    query->hidden_size != 896 || query->attention_heads != 14 ||
+	    query->kv_heads != 2 || query->head_dim != 64 ||
+	    query->intermediate_size != 4864 || query->vocab_size != 151936) {
+		puts_("virt-llm-test model query mismatch\n");
+		return -1;
+	}
+	puts_("virt-llm-test model query ok: hidden=");
+	print_dec(query->hidden_size);
+	puts_(" layers=");
+	print_dec(query->layers);
+	puts_("\n");
+	return 0;
+}
+
+static int run_gemm_f32(int fd, struct virt_llm_user_buffer *a_buf, u32 *a_raw,
+			struct virt_llm_user_buffer *b_buf, u32 *b_raw,
+			struct virt_llm_user_buffer *out_buf, u32 *out_raw)
+{
+	struct virt_llm_user_desc desc;
+	struct virt_llm_user_cpl cpl;
+	struct virt_llm_tensor_req *req = (struct virt_llm_tensor_req *)a_raw;
+	u32 *a = (u32 *)((unsigned char *)a_raw + VIRT_LLM_REQ_DATA_OFFSET);
+	u32 *b = b_raw;
+	u32 expected[] = { 0x41980000, 0x41b00000, 0x422c0000, 0x42480000 };
+
+	memset_(a_raw, 0, PAGE_SIZE);
+	memset_(b_raw, 0, PAGE_SIZE);
+	memset_(out_raw, 0, PAGE_SIZE);
+	a[0] = 0x3f800000; a[1] = 0x40000000;
+	a[2] = 0x40400000; a[3] = 0x40800000;
+	b[0] = 0x40a00000; b[1] = 0x40c00000;
+	b[2] = 0x40e00000; b[3] = 0x41000000;
+	req->abi = VIRT_LLM_TENSOR_ABI_VERSION;
+	req->dtype = VIRT_LLM_DTYPE_F32;
+	req->rank = 2;
+	req->dims[0] = 2;
+	req->dims[1] = 2;
+	req->dims[2] = 2;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	req->weight_offset = 0;
+	req->output_offset = 0;
+
+	memset_(&desc, 0, sizeof(desc));
+	desc.opcode = VIRT_LLM_OP_GEMM_F32;
+	desc.input_handle = a_buf->handle;
+	desc.output_handle = out_buf->handle;
+	desc.len = sizeof(*req);
+	desc.command_id = 2101;
+	desc.rsvd1_handle = b_buf->handle;
+	if (syscall3(29, fd, VIRT_LLM_IOCTL_SUBMIT_DESC, (long)&desc) < 0) {
+		puts_("virt-llm-test gemm f32 submit failed\n");
+		return -1;
+	}
+	if (wait_cq(fd, &cpl) < 0) {
+		puts_("virt-llm-test gemm f32 wait failed\n");
+		return -1;
+	}
+	if (cpl.command_id != 2101 || cpl.backend != VIRT_LLM_BACKEND_TENSOR ||
+	    cpl.status != VIRT_LLM_DESC_COMPLETE) {
+		puts_("virt-llm-test gemm f32 cpl mismatch\n");
+		return -1;
+	}
+	for (unsigned int i = 0; i < 4; i++) {
+		if (out_raw[i] != expected[i])
+			return -1;
+	}
+	puts_("virt-llm-test gemm f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+	return 0;
+}
+
 static int run_gemm(int fd, struct virt_llm_user_buffer *a_buf, u32 *a,
 		    struct virt_llm_user_buffer *b_buf, u32 *b,
 		    struct virt_llm_user_buffer *out_buf, u32 *out)
@@ -390,8 +527,10 @@ void _start(void)
 		 alloc_buffer(fd, &c_buf, &c) == 0 &&
 		 alloc_buffer(fd, &out_buf, &out) == 0 &&
 		 run_info(fd) == 0 &&
+		 run_model_query(fd, &a_buf, a, &out_buf, out) == 0 &&
 		 run_gemm(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
-		 run_attention(fd, &a_buf, a, &b_buf, b, &c_buf, c, &out_buf, out) == 0)
+		 run_attention(fd, &a_buf, a, &b_buf, b, &c_buf, c, &out_buf, out) == 0 &&
+		 run_gemm_f32(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0)
 		ok = 1;
 
 	if (ok) {

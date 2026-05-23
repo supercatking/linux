@@ -100,7 +100,7 @@
 #define VIRT_LLM_CQ_LEN         8
 #define VIRT_LLM_TEST_LEN       64
 #define VIRT_LLM_USER_BUF_MAX   8
-#define VIRT_LLM_USER_BUF_SIZE  PAGE_SIZE
+#define VIRT_LLM_USER_BUF_SIZE  (64 * 1024 * 1024)
 #define VIRT_LLM_MISC_MINOR     243
 #ifndef VIRT_LLM_ATTENTION_CAUSAL
 #define VIRT_LLM_ATTENTION_CAUSAL BIT(0)
@@ -1241,13 +1241,12 @@ static long virt_llm_ioctl_alloc_buffer(struct virt_llm_dev *vdev,
 		return -ENOSPC;
 	}
 
-	buf->cpu = dma_alloc_coherent(dev, VIRT_LLM_USER_BUF_SIZE, &buf->dma,
-				      GFP_KERNEL);
+	buf->cpu = dma_alloc_coherent(dev, req.size, &buf->dma, GFP_KERNEL);
 	if (!buf->cpu) {
 		mutex_unlock(&vdev->user_lock);
 		return -ENOMEM;
 	}
-	buf->size = VIRT_LLM_USER_BUF_SIZE;
+	buf->size = req.size;
 	buf->in_use = true;
 	req.handle = i + 1;
 	req.size = buf->size;

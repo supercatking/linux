@@ -16,11 +16,23 @@
 #define VIRT_LLM_OP_GEMM_U32       0x0200
 #define VIRT_LLM_OP_CONV2D_U32     0x0201
 #define VIRT_LLM_OP_ATTENTION_Q16  0x0202
+#define VIRT_LLM_OP_MODEL_LOAD     0x0300
+#define VIRT_LLM_OP_MODEL_QUERY    0x0301
+#define VIRT_LLM_OP_EMBED_LOOKUP_F32 0x0310
+#define VIRT_LLM_OP_RMSNORM_F32    0x0311
+#define VIRT_LLM_OP_ROPE_F32       0x0312
+#define VIRT_LLM_OP_GEMM_F32       0x0313
+#define VIRT_LLM_OP_ADD_F32        0x0314
+#define VIRT_LLM_OP_SWIGLU_F32     0x0315
+#define VIRT_LLM_OP_QWEN_GQA_ATTENTION_F32 0x0316
+#define VIRT_LLM_OP_LM_HEAD_F32    0x0317
+#define VIRT_LLM_OP_ARGMAX_F32     0x0318
 
 #define VIRT_LLM_DESC_F_READY      (1U << 0)
 #define VIRT_LLM_DESC_COMPLETE     1
 #define VIRT_LLM_DESC_UNSUPP       0x80000002U
 #define VIRT_LLM_DESC_BAD_KERNEL   0x80000004U
+#define VIRT_LLM_DESC_BAD_TENSOR   0x80000005U
 
 #define VIRT_LLM_BACKEND_COMPAT    0
 #define VIRT_LLM_BACKEND_DMA       1
@@ -35,6 +47,20 @@
 #define VIRT_LLM_KERNEL_ABI_VERSION  1
 
 #define VIRT_LLM_ATTENTION_CAUSAL  (1U << 0)
+
+#define VIRT_LLM_TENSOR_ABI_VERSION 1
+#define VIRT_LLM_DTYPE_U32          1
+#define VIRT_LLM_DTYPE_F32          2
+
+#define VIRT_LLM_QWEN_LAYERS        24
+#define VIRT_LLM_QWEN_HIDDEN        896
+#define VIRT_LLM_QWEN_HEADS         14
+#define VIRT_LLM_QWEN_KV_HEADS      2
+#define VIRT_LLM_QWEN_HEAD_DIM      64
+#define VIRT_LLM_QWEN_INTERMEDIATE  4864
+#define VIRT_LLM_QWEN_VOCAB         151936
+
+#define VIRT_LLM_TENSOR_F_CAUSAL    (1U << 0)
 
 struct virt_llm_user_info {
 	__u32 magic;
@@ -78,6 +104,41 @@ struct virt_llm_user_cpl {
 	__u32 q_head;
 	__u32 q_error;
 	__u32 reserved;
+};
+
+struct virt_llm_tensor_req {
+	__u32 abi;
+	__u32 dtype;
+	__u32 rank;
+	__u32 flags;
+	__u32 layer_id;
+	__u32 tensor_id;
+	__u32 aux_tensor_id;
+	__u32 reserved0;
+	__u32 dims[4];
+	__u32 input_offset;
+	__u32 weight_offset;
+	__u32 aux_offset;
+	__u32 output_offset;
+	__u32 input2_offset;
+	__u32 reserved1;
+	__u64 scalar0_bits;
+	__u64 scalar1_bits;
+};
+
+struct virt_llm_model_query {
+	__u32 abi;
+	__u32 model_loaded;
+	__u32 layers;
+	__u32 hidden_size;
+	__u32 attention_heads;
+	__u32 kv_heads;
+	__u32 head_dim;
+	__u32 intermediate_size;
+	__u32 vocab_size;
+	__u32 dtype;
+	__u64 rope_theta_bits;
+	__u64 rms_eps_bits;
 };
 
 #define VIRT_LLM_IOCTL_GET_INFO \
