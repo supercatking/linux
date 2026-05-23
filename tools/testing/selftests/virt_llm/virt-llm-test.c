@@ -37,6 +37,9 @@ typedef unsigned long long u64;
 #define VIRT_LLM_DTYPE_F32         2
 #define VIRT_LLM_REQ_DATA_OFFSET   128
 #define VIRT_LLM_TENSOR_F_CAUSAL   (1U << 0)
+#define VIRT_LLM_TENSOR_QWEN_LAYER_BASE 1000
+#define VIRT_LLM_TENSOR_QWEN_LAYER_STRIDE 16
+#define VIRT_LLM_TENSOR_QWEN_Q_PROJ     2
 
 #define _IOC_NRBITS     8
 #define _IOC_TYPEBITS   8
@@ -132,6 +135,8 @@ struct virt_llm_model_query {
 	u64 rope_theta_bits;
 	u64 rms_eps_bits;
 };
+
+static void init_req(struct virt_llm_tensor_req *req);
 
 #define VIRT_LLM_IOCTL_GET_INFO \
 	_IOR(VIRT_LLM_IOCTL_MAGIC, 0x00, struct virt_llm_user_info)
@@ -461,6 +466,55 @@ static int run_gemm_f32(int fd, struct virt_llm_user_buffer *a_buf, u32 *a_raw,
 	return 0;
 }
 
+static int run_qwen_weight_gemm_f32(int fd,
+				    struct virt_llm_user_buffer *a_buf,
+				    u32 *a_raw,
+				    struct virt_llm_user_buffer *out_buf,
+				    u32 *out_raw)
+{
+	struct virt_llm_user_desc desc;
+	struct virt_llm_user_cpl cpl;
+	struct virt_llm_tensor_req *req = (struct virt_llm_tensor_req *)a_raw;
+	u32 *a = (u32 *)((unsigned char *)a_raw + VIRT_LLM_REQ_DATA_OFFSET);
+
+	memset_(a_raw, 0, PAGE_SIZE);
+	memset_(out_raw, 0, PAGE_SIZE);
+	a[0] = 0x3f800000;
+	init_req(req);
+	req->rank = 2;
+	req->dims[0] = 1;
+	req->dims[1] = 896;
+	req->dims[2] = 896;
+	req->input_offset = VIRT_LLM_REQ_DATA_OFFSET;
+	req->tensor_id = VIRT_LLM_TENSOR_QWEN_LAYER_BASE +
+			 VIRT_LLM_TENSOR_QWEN_Q_PROJ;
+	memset_(&desc, 0, sizeof(desc));
+	desc.opcode = VIRT_LLM_OP_GEMM_F32;
+	desc.input_handle = a_buf->handle;
+	desc.output_handle = out_buf->handle;
+	desc.len = sizeof(*req);
+	desc.command_id = 2102;
+	if (syscall3(29, fd, VIRT_LLM_IOCTL_SUBMIT_DESC, (long)&desc) < 0) {
+		puts_("virt-llm-test qwen weight gemm submit failed\n");
+		return -1;
+	}
+	if (wait_cq(fd, &cpl) < 0) {
+		puts_("virt-llm-test qwen weight gemm wait failed\n");
+		return -1;
+	}
+	if (cpl.command_id != 2102 || cpl.backend != VIRT_LLM_BACKEND_TENSOR ||
+	    cpl.status != VIRT_LLM_DESC_COMPLETE || cpl.result == 0) {
+		puts_("virt-llm-test qwen weight gemm mismatch result=");
+		print_hex(cpl.result);
+		puts_("\n");
+		return -1;
+	}
+	puts_("virt-llm-test qwen weight gemm f32 ok: checksum=");
+	print_hex(cpl.result);
+	puts_("\n");
+	return 0;
+}
+
 static void init_req(struct virt_llm_tensor_req *req)
 {
 	memset_(req, 0, sizeof(*req));
@@ -769,6 +823,7 @@ void _start(void)
 		 run_gemm(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
 		 run_attention(fd, &a_buf, a, &b_buf, b, &c_buf, c, &out_buf, out) == 0 &&
 		 run_gemm_f32(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
+		 run_qwen_weight_gemm_f32(fd, &a_buf, a, &out_buf, out) == 0 &&
 		 run_embed_f32(fd, &a_buf, a, &b_buf, b, &out_buf, out) == 0 &&
 		 run_simple_vector_f32(fd, &a_buf, a, &b_buf, b, &c_buf, c,
 				       &out_buf, out) == 0)
