@@ -8,6 +8,7 @@ typedef unsigned long ulong;
 typedef unsigned long long u64;
 
 #define AT_FDCWD        -100
+#define O_RDONLY        00
 #define O_RDWR          02
 #define S_IFCHR         0020000
 #define PROT_READ       0x1
@@ -268,11 +269,83 @@ static u32 devno(unsigned int major, unsigned int minor)
 	return ((minor & 0xff) | (major << 8) | ((minor & ~0xff) << 12));
 }
 
+
+static int name_eq(const char *a, const char *b)
+{
+	while (*a && *b && *a == *b) {
+		a++;
+		b++;
+	}
+	return !*a && !*b;
+}
+
+static int parse_misc_minor(const char *buf, unsigned int len)
+{
+	unsigned int i = 0;
+
+	while (i < len) {
+		unsigned int minor = 0;
+		char name[32];
+		unsigned int n = 0;
+		int have_digit = 0;
+
+		while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+			i++;
+		while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+			have_digit = 1;
+			minor = minor * 10 + (buf[i] - '0');
+			i++;
+		}
+		while (i < len && (buf[i] == ' ' || buf[i] == '\t'))
+			i++;
+		while (i < len && buf[i] != '\n' && n + 1 < sizeof(name))
+			name[n++] = buf[i++];
+		name[n] = 0;
+		while (i < len && buf[i] != '\n')
+			i++;
+		if (i < len && buf[i] == '\n')
+			i++;
+		if (have_digit && name_eq(name, "virt_llm0"))
+			return (int)minor;
+	}
+	return -1;
+}
+
+static int find_virt_llm_minor(void)
+{
+	char buf[1024];
+	long fd;
+	long n;
+
+	fd = syscall4(56, AT_FDCWD, (long)"/proc/misc", O_RDONLY, 0);
+	if (fd < 0)
+		return -1;
+	n = syscall3(63, fd, (long)buf, sizeof(buf) - 1);
+	syscall1(57, fd);
+	if (n <= 0)
+		return -1;
+	buf[n] = 0;
+	return parse_misc_minor(buf, (unsigned int)n);
+}
+
 static int open_dev(void)
 {
+	long fd;
+	int minor;
+	long rc;
+
+	fd = syscall4(56, AT_FDCWD, (long)"/dev/virt_llm0", O_RDWR, 0);
+	if (fd >= 0)
+		return fd;
+
 	syscall3(34, AT_FDCWD, (long)"/dev", 0755);
-	syscall4(33, AT_FDCWD, (long)"/dev/virt_llm0", S_IFCHR | 0600,
-		 devno(10, 243));
+	minor = find_virt_llm_minor();
+	if (minor < 0)
+		minor = 243;
+	rc = syscall4(33, AT_FDCWD, (long)"/dev/virt_llm0", S_IFCHR | 0600,
+		      devno(10, (unsigned int)minor));
+	if (rc < 0)
+		puts_("mknod /dev/virt_llm0 failed\n");
 	return syscall4(56, AT_FDCWD, (long)"/dev/virt_llm0", O_RDWR, 0);
 }
 
