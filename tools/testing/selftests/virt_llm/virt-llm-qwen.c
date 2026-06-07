@@ -43,8 +43,26 @@ typedef unsigned long long u64;
 #define QWEN_INTERMEDIATE  4864
 #define QWEN_VOCAB         151936
 #define QWEN_LAYER_COUNT   24
-#define QWEN_MAX_NEW_TOKENS 8
-#define QWEN_MAX_CONTEXT   (1 + QWEN_MAX_NEW_TOKENS)
+#ifndef QWEN_FIXTURE_PROMPT
+#define QWEN_FIXTURE_PROMPT "What is the capital of France?"
+#endif
+#ifndef QWEN_PROMPT_TOKEN_COUNT
+#define QWEN_PROMPT_TOKEN_COUNT 36
+#endif
+#ifndef QWEN_PROMPT_TOKENS
+#define QWEN_PROMPT_TOKENS \
+	{ 151644, 8948, 198, 2610, 525, 1207, 16948, 11, 3465, 553, \
+	  54364, 14817, 13, 1446, 525, 264, 10950, 17847, 13, 151645, \
+	  198, 151644, 872, 198, 3838, 374, 279, 6722, 315, 9625, 30, \
+	  151645, 198, 151644, 77091, 198 }
+#endif
+#ifndef QWEN_EXPECTED_FIRST_TOKEN
+#define QWEN_EXPECTED_FIRST_TOKEN 785
+#endif
+#ifndef QWEN_DECODE_STEPS
+#define QWEN_DECODE_STEPS 1
+#endif
+#define QWEN_MAX_CONTEXT   (QWEN_PROMPT_TOKEN_COUNT + QWEN_DECODE_STEPS)
 
 #define T_EMBED       1
 #define T_FINAL_NORM  2
@@ -142,6 +160,8 @@ struct buf {
 	struct virt_llm_user_buffer ubuf;
 	u32 *ptr;
 };
+
+static const u32 qwen_prompt_tokens[QWEN_PROMPT_TOKEN_COUNT] = QWEN_PROMPT_TOKENS;
 
 static inline long syscall0(long n)
 {
@@ -262,6 +282,15 @@ static void print_hex(u32 v)
 	for (int i = 0; i < 8; i++)
 		out[2 + i] = h[(v >> (28 - i * 4)) & 0xf];
 	puts_(out);
+}
+
+static void print_token_list(const u32 *tokens, u32 count)
+{
+	for (u32 i = 0; i < count; i++) {
+		print_dec(tokens[i]);
+		if (i + 1 != count)
+			puts_(",");
+	}
 }
 
 static u32 devno(unsigned int major, unsigned int minor)
@@ -416,6 +445,16 @@ static int submit_desc(int fd, u32 opcode, u32 backend, u32 command_id,
 static u32 layer_tensor(u32 layer, u32 slot)
 {
 	return T_LAYER_BASE + layer * T_LAYER_STRIDE + slot;
+}
+
+static int qwen_progress_failed(const char *stage, u32 layer)
+{
+	puts_("qwen progress failed stage=");
+	puts_(stage);
+	puts_(" layer=");
+	print_dec(layer);
+	puts_("\n");
+	return -1;
 }
 
 static int model_load(int fd, struct buf *a, struct buf *b)
@@ -599,10 +638,11 @@ static int argmax(int fd, struct buf *logits, struct buf *token, u32 seq)
 {
 	struct virt_llm_tensor_req *req = (struct virt_llm_tensor_req *)logits->ptr;
 
+	(void)seq;
 	init_req(req);
 	req->rank = 1;
 	req->dims[0] = QWEN_VOCAB;
-	req->input_offset = DATA_OFF + (seq - 1) * QWEN_VOCAB * sizeof(u32);
+	req->input_offset = DATA_OFF;
 	req->output_offset = DATA_OFF;
 	return submit_desc(fd, VIRT_LLM_OP_ARGMAX_F32, VIRT_LLM_BACKEND_VECTOR,
 			   90, logits, token, 0, 0);
@@ -612,58 +652,58 @@ static int run_qwen_forward(int fd, struct buf *b, u32 *token_ids, u32 seq,
 			    u32 *next_token)
 {
 	if (embed(fd, &b[1], &b[0], token_ids, seq) < 0)
-		return -1;
+		return qwen_progress_failed("embed", 0);
 	puts_("qwen embed ok\n");
 	for (u32 layer = 0; layer < QWEN_LAYER_COUNT; layer++) {
 		if (rmsnorm(fd, 20, &b[0], &b[1],
 			    layer_tensor(layer, T_INPUT_NORM), seq) < 0)
-			return -1;
+			return qwen_progress_failed("input_norm", layer);
 		if (gemm_bias(fd, 30, &b[1], &b[2], layer_tensor(layer, T_Q_PROJ),
 			      layer_tensor(layer, T_Q_BIAS), seq, QWEN_HIDDEN,
 			      QWEN_HIDDEN) < 0)
-			return -1;
+			return qwen_progress_failed("q_proj", layer);
 		if (gemm_bias(fd, 31, &b[1], &b[3], layer_tensor(layer, T_K_PROJ),
 			      layer_tensor(layer, T_K_BIAS), seq,
 			      QWEN_KV_HEADS * QWEN_HEAD_DIM, QWEN_HIDDEN) < 0)
-			return -1;
+			return qwen_progress_failed("k_proj", layer);
 		if (gemm_bias(fd, 32, &b[1], &b[4], layer_tensor(layer, T_V_PROJ),
 			      layer_tensor(layer, T_V_BIAS), seq,
 			      QWEN_KV_HEADS * QWEN_HEAD_DIM, QWEN_HIDDEN) < 0)
-			return -1;
+			return qwen_progress_failed("v_proj", layer);
 		if (rope(fd, 33, &b[2], seq, QWEN_HEADS) < 0 ||
 		    rope(fd, 34, &b[3], seq, QWEN_KV_HEADS) < 0)
-			return -1;
+			return qwen_progress_failed("rope", layer);
 		if (gqa(fd, &b[2], &b[3], &b[4], &b[5], seq) < 0)
-			return -1;
+			return qwen_progress_failed("gqa", layer);
 		if (gemm(fd, 50, &b[5], &b[6], layer_tensor(layer, T_O_PROJ),
 			 seq, QWEN_HIDDEN, QWEN_HIDDEN, VIRT_LLM_OP_GEMM_F32) < 0)
-			return -1;
+			return qwen_progress_failed("o_proj", layer);
 		if (add(fd, 51, &b[0], &b[6], seq) < 0)
-			return -1;
+			return qwen_progress_failed("attn_residual", layer);
 		if (rmsnorm(fd, 60, &b[0], &b[1],
 			    layer_tensor(layer, T_POST_NORM), seq) < 0)
-			return -1;
+			return qwen_progress_failed("post_norm", layer);
 		if (gemm(fd, 61, &b[1], &b[2], layer_tensor(layer, T_GATE_PROJ),
 			 seq, QWEN_INTERMEDIATE, QWEN_HIDDEN, VIRT_LLM_OP_GEMM_F32) < 0)
-			return -1;
+			return qwen_progress_failed("gate_proj", layer);
 		if (gemm(fd, 62, &b[1], &b[3], layer_tensor(layer, T_UP_PROJ),
 			 seq, QWEN_INTERMEDIATE, QWEN_HIDDEN, VIRT_LLM_OP_GEMM_F32) < 0)
-			return -1;
+			return qwen_progress_failed("up_proj", layer);
 		if (swiglu(fd, &b[2], &b[3], seq) < 0)
-			return -1;
+			return qwen_progress_failed("swiglu", layer);
 		if (gemm(fd, 71, &b[2], &b[6], layer_tensor(layer, T_DOWN_PROJ),
 			 seq, QWEN_HIDDEN, QWEN_INTERMEDIATE, VIRT_LLM_OP_GEMM_F32) < 0)
-			return -1;
+			return qwen_progress_failed("down_proj", layer);
 		if (add(fd, 72, &b[0], &b[6], seq) < 0)
-			return -1;
+			return qwen_progress_failed("mlp_residual", layer);
 	}
 	puts_("qwen full layers ok\n");
 	if (rmsnorm(fd, 80, &b[0], &b[1], T_FINAL_NORM, seq) < 0)
-		return -1;
+		return qwen_progress_failed("final_norm", QWEN_LAYER_COUNT);
 	if (lm_head(fd, &b[1], &b[5], seq) < 0)
-		return -1;
+		return qwen_progress_failed("lm_head", QWEN_LAYER_COUNT);
 	if (argmax(fd, &b[5], &b[7], seq) < 0)
-		return -1;
+		return qwen_progress_failed("argmax", QWEN_LAYER_COUNT);
 	*next_token = *(u32 *)((unsigned char *)b[7].ptr + DATA_OFF);
 	return 0;
 }
@@ -671,31 +711,53 @@ static int run_qwen_forward(int fd, struct buf *b, u32 *token_ids, u32 seq,
 static int run_qwen_decode(int fd, struct buf *b)
 {
 	u32 token_ids[QWEN_MAX_CONTEXT];
+	u32 output_tokens[QWEN_DECODE_STEPS];
 
 	if (model_load(fd, &b[0], &b[1]) < 0)
 		return -1;
 	puts_("qwen model load ok\n");
-	token_ids[0] = 785;
-	for (u32 step = 0; step < QWEN_MAX_NEW_TOKENS; step++) {
+	puts_("qwen fixture prompt=");
+	puts_(QWEN_FIXTURE_PROMPT);
+	puts_("\n");
+	puts_("qwen fixture input_tokens=");
+	print_token_list(qwen_prompt_tokens, QWEN_PROMPT_TOKEN_COUNT);
+	puts_("\n");
+	for (u32 i = 0; i < QWEN_PROMPT_TOKEN_COUNT; i++)
+		token_ids[i] = qwen_prompt_tokens[i];
+	for (u32 step = 0; step < QWEN_DECODE_STEPS; step++) {
 		u32 next = 0;
-		u32 seq = step + 1;
+		u32 seq = QWEN_PROMPT_TOKEN_COUNT + step;
 
 		if (run_qwen_forward(fd, b, token_ids, seq, &next) < 0)
 			return -1;
 		token_ids[seq] = next;
+		output_tokens[step] = next;
 		puts_("qwen decode step token=");
 		print_dec(next);
 		puts_("\n");
 	}
+	if (output_tokens[0] != QWEN_EXPECTED_FIRST_TOKEN) {
+		puts_("QWEN_INFER_FAILED expected_first=");
+		print_dec(QWEN_EXPECTED_FIRST_TOKEN);
+		puts_(" current_first=");
+		print_dec(output_tokens[0]);
+		puts_(" input_tokens=");
+		print_token_list(qwen_prompt_tokens, QWEN_PROMPT_TOKEN_COUNT);
+		puts_(" output_tokens=");
+		print_token_list(output_tokens, QWEN_DECODE_STEPS);
+		puts_("\n");
+		return -1;
+	}
 	puts_("QWEN_SINGLE_TOKEN_OK token=");
-	print_dec(token_ids[1]);
+	print_dec(output_tokens[0]);
 	puts_("\n");
 	puts_("QWEN_DECODE_OK tokens=");
-	for (u32 i = 1; i <= QWEN_MAX_NEW_TOKENS; i++) {
-		print_dec(token_ids[i]);
-		if (i != QWEN_MAX_NEW_TOKENS)
-			puts_(",");
-	}
+	print_token_list(output_tokens, QWEN_DECODE_STEPS);
+	puts_("\n");
+	puts_("QWEN_INFER_OK input_tokens=");
+	print_token_list(qwen_prompt_tokens, QWEN_PROMPT_TOKEN_COUNT);
+	puts_(" output_tokens=");
+	print_token_list(output_tokens, QWEN_DECODE_STEPS);
 	puts_("\n");
 	return 0;
 }
@@ -720,6 +782,7 @@ void _start(void)
 			syscall4(142, 0xfee1dead, 672274793, 0x1234567, 0);
 	}
 
+	puts_("QWEN_INFER_FAILED\n");
 	puts_("QWEN_SINGLE_TOKEN_FAILED\n");
 	syscall1(93, 1);
 	for (;;)
