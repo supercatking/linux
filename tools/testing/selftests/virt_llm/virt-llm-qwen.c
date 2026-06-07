@@ -59,8 +59,12 @@ typedef unsigned long long u64;
 #ifndef QWEN_EXPECTED_FIRST_TOKEN
 #define QWEN_EXPECTED_FIRST_TOKEN 785
 #endif
+#ifndef QWEN_EXPECTED_TOKENS
+#define QWEN_EXPECTED_TOKENS \
+	{ 785, 6722, 315, 9625, 374, 12095, 13, 151645 }
+#endif
 #ifndef QWEN_DECODE_STEPS
-#define QWEN_DECODE_STEPS 1
+#define QWEN_DECODE_STEPS 8
 #endif
 #define QWEN_MAX_CONTEXT   (QWEN_PROMPT_TOKEN_COUNT + QWEN_DECODE_STEPS)
 
@@ -162,6 +166,7 @@ struct buf {
 };
 
 static const u32 qwen_prompt_tokens[QWEN_PROMPT_TOKEN_COUNT] = QWEN_PROMPT_TOKENS;
+static const u32 qwen_expected_tokens[QWEN_DECODE_STEPS] = QWEN_EXPECTED_TOKENS;
 
 static inline long syscall0(long n)
 {
@@ -736,17 +741,21 @@ static int run_qwen_decode(int fd, struct buf *b)
 		print_dec(next);
 		puts_("\n");
 	}
-	if (output_tokens[0] != QWEN_EXPECTED_FIRST_TOKEN) {
-		puts_("QWEN_INFER_FAILED expected_first=");
-		print_dec(QWEN_EXPECTED_FIRST_TOKEN);
-		puts_(" current_first=");
-		print_dec(output_tokens[0]);
-		puts_(" input_tokens=");
-		print_token_list(qwen_prompt_tokens, QWEN_PROMPT_TOKEN_COUNT);
-		puts_(" output_tokens=");
-		print_token_list(output_tokens, QWEN_DECODE_STEPS);
-		puts_("\n");
-		return -1;
+	for (u32 step = 0; step < QWEN_DECODE_STEPS; step++) {
+		if (output_tokens[step] != qwen_expected_tokens[step]) {
+			puts_("QWEN_INFER_FAILED step=");
+			print_dec(step);
+			puts_(" expected=");
+			print_dec(qwen_expected_tokens[step]);
+			puts_(" current=");
+			print_dec(output_tokens[step]);
+			puts_(" input_tokens=");
+			print_token_list(qwen_prompt_tokens, QWEN_PROMPT_TOKEN_COUNT);
+			puts_(" output_tokens=");
+			print_token_list(output_tokens, QWEN_DECODE_STEPS);
+			puts_("\n");
+			return -1;
+		}
 	}
 	puts_("QWEN_SINGLE_TOKEN_OK token=");
 	print_dec(output_tokens[0]);
