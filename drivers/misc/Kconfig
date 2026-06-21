@@ -104,6 +104,15 @@ config PHANTOM
 	  If you choose to build module, its name will be phantom. If unsure,
 	  say N here.
 
+config VIRT_LLM_PCI
+	bool "QEMU virtual LLM PCI prototype"
+	depends on PCI && HAS_IOMEM
+	help
+	  Enable the minimal PCI driver for QEMU virt-llm prototype
+	  accelerator device. The driver validates PCI enumeration and BAR0
+	  MMIO register access with queue, DMA buffer, interrupt, and userspace
+	  runtime tests.
+
 config RPMB
 	tristate "RPMB partition interface"
 	help
